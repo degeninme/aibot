@@ -18,10 +18,10 @@ import (
 
 // Well-known Solana program addresses
 const (
-	// PumpFun program - most memecoins launch here
+	// PumpFun program - memecoins launch and trade on bonding curve here
 	PumpFunProgram = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-	// Raydium AMM v4 - liquidity pools
-	RaydiumAMMProgram = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+	// PumpSwap AMM - tokens graduate here after completing bonding curve
+	PumpSwapProgram = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 )
 
 // JSON-RPC request/response types
@@ -238,11 +238,13 @@ func (s *ChainScannerAgent) getTransaction(sig string) (*txResult, error) {
 	return &tx, nil
 }
 
-// scanSolanaNewTokens scans PumpFun and Raydium for new token launches
+// scanSolanaNewTokens scans PumpFun (bonding curve) and PumpSwap (graduated tokens)
 func (s *ChainScannerAgent) scanSolanaNewTokens() {
 	log.Println("ChainScannerAgent: Scanning Solana for new tokens...")
+	// Scan PumpFun bonding curve - catches tokens at launch
 	s.scanProgram(PumpFunProgram, "pumpfun", 10)
-	s.scanProgram(RaydiumAMMProgram, "raydium", 5)
+	// Scan PumpSwap - catches tokens that graduated from bonding curve
+	s.scanProgram(PumpSwapProgram, "pumpswap", 5)
 }
 
 // scanProgram scans a specific Solana program for new token events
