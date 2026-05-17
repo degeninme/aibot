@@ -9,6 +9,7 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -22,6 +23,10 @@ const (
 	PumpFunProgram = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 	// PumpSwap AMM - tokens graduate here after completing bonding curve
 	PumpSwapProgram = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+	// Token Program - used to identify mint creation
+	TokenProgram = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+	// SPL Token 2022
+	Token2022Program = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 )
 
 // JSON-RPC request/response types
@@ -58,6 +63,7 @@ type txResult struct {
 			Instructions []struct {
 				ProgramIDIndex int    `json:"programIdIndex"`
 				Data           string `json:"data"`
+				Accounts       []int  `json:"accounts"`
 			} `json:"instructions"`
 		} `json:"message"`
 	} `json:"transaction"`
@@ -66,6 +72,13 @@ type txResult struct {
 		PreTokenBalances  []tokenBalance `json:"preTokenBalances"`
 		LogMessages       []string       `json:"logMessages"`
 		Err               interface{}    `json:"err"`
+		// Inner instructions for detecting token creation
+		InnerInstructions []struct {
+			Instructions []struct {
+				ProgramIDIndex int    `json:"programIdIndex"`
+				Data           string `json:"data"`
+			} `json:"instructions"`
+		} `json:"innerInstructions"`
 	} `json:"meta"`
 	BlockTime *int64 `json:"blockTime"`
 }
@@ -75,7 +88,9 @@ type tokenBalance struct {
 	Mint         string `json:"mint"`
 	Owner        string `json:"owner"`
 	UITokenAmount struct {
-		UIAmount float64 `json:"uiAmount"`
+		UIAmount       float64 `json:"uiAmount"`
+		Amount         string  `json:"amount"`
+		Decimals       int     `json:"decimals"`
 	} `json:"uiTokenAmount"`
 }
 
@@ -89,6 +104,9 @@ type ChainScannerAgent struct {
 	httpClient   *http.Client
 	seenSigs     map[string]bool
 	seenSigsMu   sync.Mutex
+	// Track seen mints to avoid duplicate token emissions
+	seenMints    map[string]bool
+	seenMintsMu  sync.Mutex
 }
 
 // NewChainScannerAgent creates a new chain scanner agent
@@ -101,6 +119,7 @@ func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
 		cancel:       cancel,
 		httpClient:   &http.Client{Timeout: 15 * time.Second},
 		seenSigs:     make(map[string]bool),
+		seenMints:    make(map[string]bool),
 	}
 }
 
@@ -242,7 +261,7 @@ func (s *ChainScannerAgent) getTransaction(sig string) (*txResult, error) {
 func (s *ChainScannerAgent) scanSolanaNewTokens() {
 	log.Println("ChainScannerAgent: Scanning Solana for new tokens...")
 	// Scan PumpFun bonding curve - catches tokens at launch
-	s.scanProgram(PumpFunProgram, "pumpfun", 10)
+	s.scanProgram(PumpFunProgram, "pumpfun", 15)
 	// Scan PumpSwap - catches tokens that graduated from bonding curve
 	s.scanProgram(PumpSwapProgram, "pumpswap", 5)
 }
@@ -255,6 +274,9 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 		return
 	}
 
+	log.Printf("ChainScannerAgent: [%s] Got %d signatures to check\n", source, len(sigs))
+
+	newCount := 0
 	for _, sig := range sigs {
 		if sig.Err != nil {
 			continue
@@ -273,10 +295,11 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 		if seen {
 			continue
 		}
+		newCount++
 
 		tx, err := s.getTransaction(sig.Signature)
 		if err != nil {
-			log.Printf("ChainScannerAgent: Error fetching tx %s: %v\n", sig.Signature, err)
+			log.Printf("ChainScannerAgent: Error fetching tx %s: %v\n", sig.Signature[:20], err)
 			continue
 		}
 		if tx == nil || tx.Meta.Err != nil {
@@ -285,20 +308,51 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 
 		token := s.extractTokenFromTx(tx, sig.Signature, source)
 		if token != nil {
-			log.Printf("ChainScannerAgent: 🚀 New token found via %s! Mint: %s\n", source, token.TokenAddress)
-			s.emitTokenFound(*token)
+			// Deduplicate by mint address
+			s.seenMintsMu.Lock()
+			mintSeen := s.seenMints[token.TokenAddress]
+			if !mintSeen {
+				s.seenMints[token.TokenAddress] = true
+			}
+			s.seenMintsMu.Unlock()
+
+			if !mintSeen {
+				log.Printf("ChainScannerAgent: 🚀 New token via %s! Mint: %s tx: %s\n",
+					source, token.TokenAddress, sig.Signature[:20])
+				s.emitTokenFound(*token)
+			}
 		}
 	}
+	log.Printf("ChainScannerAgent: [%s] %d new txs processed\n", source, newCount)
 }
 
 // extractTokenFromTx parses a transaction and extracts new token info
+// For PumpFun: every "create" tx creates a new token mint
+// For PumpSwap: pool creation txs contain the graduated token mint
 func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source string) *models.TokenFound {
 	accounts := tx.Transaction.Message.AccountKeys
 	if len(accounts) == 0 {
 		return nil
 	}
 
-	// Find new mints: in postTokenBalances but not in preTokenBalances
+	// Strategy 1: Look for "create" event in PumpFun logs
+	// PumpFun emits: "Program log: Instruction: Create"
+	isPumpFunCreate := false
+	if source == "pumpfun" {
+		for _, msg := range tx.Meta.LogMessages {
+			if strings.Contains(msg, "Instruction: Create") {
+				isPumpFunCreate = true
+				break
+			}
+		}
+		if !isPumpFunCreate {
+			// Not a token creation tx, skip
+			return nil
+		}
+	}
+
+	// Strategy 2: Find mints from postTokenBalances
+	// New mints appear in post but not pre
 	preMints := make(map[string]bool)
 	for _, bal := range tx.Meta.PreTokenBalances {
 		preMints[bal.Mint] = true
@@ -308,7 +362,7 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 	var reserveToken float64
 
 	for _, bal := range tx.Meta.PostTokenBalances {
-		if !preMints[bal.Mint] && bal.Mint != "" {
+		if bal.Mint != "" && !preMints[bal.Mint] {
 			newMint = bal.Mint
 			reserveToken = bal.UITokenAmount.UIAmount
 			if bal.Owner != "" {
@@ -318,21 +372,34 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 		}
 	}
 
+	// Strategy 3: For PumpFun creates, the mint is typically account index 0 or 1
+	// If we couldn't find it via token balances, check account keys
+	// PumpFun token addresses end in "pump"
+	if newMint == "" && source == "pumpfun" {
+		for _, acc := range accounts {
+			if strings.HasSuffix(acc, "pump") {
+				newMint = acc
+				break
+			}
+		}
+	}
+
 	if newMint == "" {
 		return nil
 	}
 
-	// Fallback: use fee payer as creator
+	// Creator is the fee payer (first account) for PumpFun
 	if creatorAddress == "" && len(accounts) > 0 {
 		creatorAddress = accounts[0]
 	}
 
-	// Estimate SOL reserve from log messages
+	// Parse SOL reserve from logs - try multiple patterns
 	reserveNative := s.estimateSOLReserve(tx.Meta.LogMessages)
 
-	// Filter by minimum liquidity (rough USD estimate at ~$150/SOL)
+	// Apply liquidity filter ONLY if we actually parsed a reserve value
+	// If reserve is 0 (couldn't parse), let it through with 0 — don't silently drop
 	if reserveNative > 0 {
-		liquidityUSD := reserveNative * 150.0
+		liquidityUSD := reserveNative * 150.0 // rough SOL/USD
 		if liquidityUSD < s.config.MinLiquidity {
 			log.Printf("ChainScannerAgent: Skipping %s - liquidity $%.2f below minimum $%.2f\n",
 				newMint, liquidityUSD, s.config.MinLiquidity)
@@ -366,11 +433,22 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 func (s *ChainScannerAgent) estimateSOLReserve(logs []string) float64 {
 	for _, msg := range logs {
 		var amount float64
+		// PumpFun bonding curve patterns
 		if n, _ := fmt.Sscanf(msg, "Program log: sol_amount: %f", &amount); n == 1 {
 			return amount / 1e9
 		}
 		if n, _ := fmt.Sscanf(msg, "Program log: virtual_sol_reserves: %f", &amount); n == 1 {
 			return amount / 1e9
+		}
+		if n, _ := fmt.Sscanf(msg, "Program log: real_sol_reserves: %f", &amount); n == 1 {
+			return amount / 1e9
+		}
+		// PumpSwap pool patterns
+		if strings.Contains(msg, "sol_reserves") {
+			var label string
+			if n, _ := fmt.Sscanf(msg, "Program log: %s %f", &label, &amount); n == 2 {
+				return amount / 1e9
+			}
 		}
 	}
 	return 0
