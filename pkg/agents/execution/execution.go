@@ -12,6 +12,7 @@ import (
 	"math/big"
 	"net/http"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/mumugogoing/meme_bot/pkg/config"
@@ -122,7 +123,7 @@ func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
 	agent := &ExecutionAgent{
 		config:       cfg,
 		httpClient:   &http.Client{Timeout: 30 * time.Second},
-		quicknodeURL: os.Getenv("QUICKNODE_URL"),
+		quicknodeURL: strings.TrimRight(os.Getenv("QUICKNODE_URL"), "/"),
 	}
 
 	if agent.quicknodeURL == "" {
@@ -174,7 +175,7 @@ func (e *ExecutionAgent) getSwapTransaction(mint string, lamports uint64) (strin
 		Mint:             mint,
 		InAmount:         fmt.Sprintf("%d", lamports),
 		PriorityFeeLevel: "high",
-		SlippageBps:      "500", // 5% slippage tolerance
+		SlippageBps:      "5000", // 50% slippage tolerance (new tokens move fast)
 	}
 
 	jsonBody, err := json.Marshal(body)
