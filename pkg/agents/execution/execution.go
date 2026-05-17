@@ -289,31 +289,35 @@ func compactU16(n int) []byte {
 	return []byte{byte(n&0x7f | 0x80), byte(n >> 7)}
 }
 
-// buildTransaction builds a signed legacy Solana transaction
+// Instruction represents a single Solana instruction
+type Instruction struct {
+	ProgramID string
+	Accounts  []string
+	Data      []byte
+}
+
+// buildTransaction builds a signed legacy Solana transaction with multiple instructions
 func (e *ExecutionAgent) buildTransaction(
 	blockhash string,
-	programID string,
-	accounts []string,
-	instrData []byte,
+	instructions []Instruction,
 ) (string, error) {
 	feePayer := base58Encode(e.publicKey)
 
-	// Deduplicate and order accounts: feePayer first
+	// Collect all unique account keys, starting with feePayer
 	keyOrder := []string{feePayer}
 	keySet := map[string]int{feePayer: 0}
-	for _, acc := range append(accounts, programID) {
-		if _, ok := keySet[acc]; !ok {
-			keySet[acc] = len(keyOrder)
-			keyOrder = append(keyOrder, acc)
+	for _, ix := range instructions {
+		for _, acc := range ix.Accounts {
+			if _, ok := keySet[acc]; !ok {
+				keySet[acc] = len(keyOrder)
+				keyOrder = append(keyOrder, acc)
+			}
+		}
+		if _, ok := keySet[ix.ProgramID]; !ok {
+			keySet[ix.ProgramID] = len(keyOrder)
+			keyOrder = append(keyOrder, ix.ProgramID)
 		}
 	}
-
-	// Account metas for instruction
-	instrAccIdxs := make([]byte, len(accounts))
-	for i, acc := range accounts {
-		instrAccIdxs[i] = byte(keySet[acc])
-	}
-	progIdx := byte(keySet[programID])
 
 	// Message header: numRequiredSigs=1, numReadonlySignedAccounts=0, numReadonlyUnsignedAccounts=len-1
 	header := []byte{1, 0, byte(len(keyOrder) - 1)}
@@ -327,13 +331,21 @@ func (e *ExecutionAgent) buildTransaction(
 	// Blockhash
 	bhBytes := mustDecode58(blockhash)
 
-	// Instruction: programIdIndex, accounts, data
-	instrBuf := []byte{}
-	instrBuf = append(instrBuf, progIdx)
-	instrBuf = append(instrBuf, compactU16(len(instrAccIdxs))...)
-	instrBuf = append(instrBuf, instrAccIdxs...)
-	instrBuf = append(instrBuf, compactU16(len(instrData))...)
-	instrBuf = append(instrBuf, instrData...)
+	// Build all instructions
+	allInstrBytes := []byte{}
+	for _, ix := range instructions {
+		instrAccIdxs := make([]byte, len(ix.Accounts))
+		for i, acc := range ix.Accounts {
+			instrAccIdxs[i] = byte(keySet[acc])
+		}
+		progIdx := byte(keySet[ix.ProgramID])
+
+		allInstrBytes = append(allInstrBytes, progIdx)
+		allInstrBytes = append(allInstrBytes, compactU16(len(instrAccIdxs))...)
+		allInstrBytes = append(allInstrBytes, instrAccIdxs...)
+		allInstrBytes = append(allInstrBytes, compactU16(len(ix.Data))...)
+		allInstrBytes = append(allInstrBytes, ix.Data...)
+	}
 
 	// Full message
 	msg := []byte{}
@@ -341,8 +353,8 @@ func (e *ExecutionAgent) buildTransaction(
 	msg = append(msg, compactU16(len(keyOrder))...)
 	msg = append(msg, addrBuf...)
 	msg = append(msg, bhBytes...)
-	msg = append(msg, compactU16(1)...) // 1 instruction
-	msg = append(msg, instrBuf...)
+	msg = append(msg, compactU16(len(instructions))...)
+	msg = append(msg, allInstrBytes...)
 
 	// Sign
 	sig := ed25519.Sign(e.privateKey, msg)
@@ -501,7 +513,29 @@ func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmoun
 		PumpFunProgram,      // program
 	}
 
-	txB64, err := e.buildTransaction(blockhash, PumpFunProgram, accounts, instrData)
+	// Build createATA instruction (idempotent — succeeds even if ATA exists)
+	// CreateIdempotent instruction discriminator = 1
+	createATAInstr := Instruction{
+		ProgramID: AssocTokenProgram,
+		Accounts: []string{
+			walletPubkey,    // funding
+			userATA,         // ATA to create
+			walletPubkey,    // wallet owner
+			mint,            // mint
+			SystemProgram,   // system program
+			Token2022Program,// token program
+		},
+		Data: []byte{1}, // CreateIdempotent
+	}
+
+	// Build buy instruction
+	buyInstr := Instruction{
+		ProgramID: PumpFunProgram,
+		Accounts:  accounts,
+		Data:      instrData,
+	}
+
+	txB64, err := e.buildTransaction(blockhash, []Instruction{createATAInstr, buyInstr})
 	if err != nil {
 		return "", fmt.Errorf("buildTransaction: %w", err)
 	}
