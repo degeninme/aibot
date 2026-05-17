@@ -17,7 +17,6 @@ import (
 	"github.com/mumugogoing/meme_bot/pkg/models"
 )
 
-// Well-known Solana program addresses
 const (
 	PumpFunProgram  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 	PumpSwapProgram = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
@@ -73,7 +72,6 @@ type tokenBalance struct {
 	} `json:"uiTokenAmount"`
 }
 
-// ChainScannerAgent monitors on-chain events for new tokens
 type ChainScannerAgent struct {
 	config       *config.Config
 	tokenChannel chan models.TokenFound
@@ -280,108 +278,138 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 	log.Printf("ChainScannerAgent: [%s] %d new txs, %d tokens found\n", source, newCount, tokenCount)
 }
 
-// extractTokenFromTx finds new token mints in a transaction.
-// For PumpFun: detects token creation via log message or "pump"-suffixed account keys.
-// For PumpSwap: detects pool creation via new mints in post token balances.
+// extractTokenFromTx extracts a new token from a transaction.
+//
+// PumpFun create txs:
+//   - Have empty preTokenBalances
+//   - postTokenBalances[0].mint is the new token mint address
+//   - Log messages contain "Instruction: Create"
+//   - The mint address ends in "pump"
+//
+// PumpSwap create_pool txs:
+//   - postTokenBalances contains the graduated token mint
+//   - Log messages contain "create_pool" or "CreatePool"
 func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source string) *models.TokenFound {
 	accounts := tx.Transaction.Message.AccountKeys
 	if len(accounts) == 0 {
 		return nil
 	}
 
-	// For PumpFun: check if this is a Create instruction by scanning logs
-	// PumpFun uses several log formats - check all of them
+	logs := tx.Meta.LogMessages
+
+	// ── PumpFun: detect token creation ──────────────────────────────────────
 	if source == "pumpfun" {
+		// Must have a "Create" log - this is the definitive signal
 		isCreate := false
-		for _, msg := range tx.Meta.LogMessages {
-			if strings.Contains(msg, "Create") ||
-				strings.Contains(msg, "create") ||
-				strings.Contains(msg, "InitializeMint") {
+		for _, msg := range logs {
+			if strings.Contains(msg, "Create") {
 				isCreate = true
 				break
 			}
 		}
-		// Also check if any account ends in "pump" (all PumpFun mints do)
-		if !isCreate {
-			for _, acc := range accounts {
-				if strings.HasSuffix(acc, "pump") {
-					isCreate = true
-					break
-				}
-			}
-		}
 		if !isCreate {
 			return nil
 		}
-	}
 
-	// Find new mints: present in post but not pre token balances
-	preMints := make(map[string]bool)
-	for _, bal := range tx.Meta.PreTokenBalances {
-		preMints[bal.Mint] = true
-	}
-
-	var newMint, creatorAddress string
-	var reserveToken float64
-
-	for _, bal := range tx.Meta.PostTokenBalances {
-		if bal.Mint != "" && !preMints[bal.Mint] {
-			newMint = bal.Mint
-			reserveToken = bal.UITokenAmount.UIAmount
-			if bal.Owner != "" {
-				creatorAddress = bal.Owner
+		// The mint is at postTokenBalances[0].mint (always index 0 for creates)
+		if len(tx.Meta.PostTokenBalances) == 0 {
+			// Fallback: find account ending in "pump"
+			for _, acc := range accounts {
+				if strings.HasSuffix(acc, "pump") {
+					return s.buildToken(acc, accounts[0], 0, 0, txHash, source, tx.BlockTime, logs)
+				}
 			}
-			break
+			return nil
 		}
-	}
 
-	// Fallback for PumpFun: mint address ends in "pump"
-	if newMint == "" && source == "pumpfun" {
-		for _, acc := range accounts {
-			if strings.HasSuffix(acc, "pump") {
-				// Make sure it's not already seen
-				s.seenMintsMu.Lock()
-				alreadySeen := s.seenMints[acc]
-				s.seenMintsMu.Unlock()
-				if !alreadySeen {
-					newMint = acc
+		mint := tx.Meta.PostTokenBalances[0].Mint
+		if mint == "" {
+			return nil
+		}
+
+		// Validate: PumpFun mints always end in "pump"
+		if !strings.HasSuffix(mint, "pump") {
+			// Try finding one that does
+			for _, bal := range tx.Meta.PostTokenBalances {
+				if strings.HasSuffix(bal.Mint, "pump") {
+					mint = bal.Mint
 					break
 				}
 			}
 		}
+
+		if mint == "" || !strings.HasSuffix(mint, "pump") {
+			return nil
+		}
+
+		reserveToken := tx.Meta.PostTokenBalances[0].UITokenAmount.UIAmount
+		reserveNative := s.estimateSOLReserve(logs)
+		creator := accounts[0] // fee payer is always creator on PumpFun
+
+		return s.buildToken(mint, creator, reserveToken, reserveNative, txHash, source, tx.BlockTime, logs)
 	}
 
-	if newMint == "" {
-		return nil
+	// ── PumpSwap: detect pool creation (graduated tokens) ───────────────────
+	if source == "pumpswap" {
+		isPoolCreate := false
+		for _, msg := range logs {
+			if strings.Contains(msg, "create_pool") ||
+				strings.Contains(msg, "CreatePool") ||
+				strings.Contains(msg, "create pool") ||
+				strings.Contains(msg, "Initialize") {
+				isPoolCreate = true
+				break
+			}
+		}
+		if !isPoolCreate {
+			return nil
+		}
+
+		// Find the non-SOL, non-WSOL mint in postTokenBalances
+		const WSOL = "So11111111111111111111111111111111111111112"
+		for _, bal := range tx.Meta.PostTokenBalances {
+			if bal.Mint != "" && bal.Mint != WSOL {
+				reserveNative := s.estimateSOLReserve(logs)
+				creator := ""
+				if len(accounts) > 0 {
+					creator = accounts[0]
+				}
+				return s.buildToken(bal.Mint, creator, bal.UITokenAmount.UIAmount, reserveNative, txHash, source, tx.BlockTime, logs)
+			}
+		}
 	}
 
-	// Creator = fee payer (first account key)
-	if creatorAddress == "" && len(accounts) > 0 {
-		creatorAddress = accounts[0]
-	}
+	return nil
+}
 
-	reserveNative := s.estimateSOLReserve(tx.Meta.LogMessages)
-
-	// Only apply liquidity filter when we have a real reserve value
+// buildToken constructs a TokenFound, applying the liquidity filter
+func (s *ChainScannerAgent) buildToken(
+	mint, creator string,
+	reserveToken, reserveNative float64,
+	txHash, source string,
+	blockTime *int64,
+	logs []string,
+) *models.TokenFound {
+	// Apply liquidity filter only when we have a real reserve value
 	if reserveNative > 0 {
 		liquidityUSD := reserveNative * 150.0
 		if liquidityUSD < s.config.MinLiquidity {
 			log.Printf("ChainScannerAgent: Skipping %s - liquidity $%.2f < min $%.2f\n",
-				newMint, liquidityUSD, s.config.MinLiquidity)
+				mint, liquidityUSD, s.config.MinLiquidity)
 			return nil
 		}
 	}
 
-	blockTime := time.Now().Unix()
-	if tx.BlockTime != nil {
-		blockTime = *tx.BlockTime
+	ts := time.Now().Unix()
+	if blockTime != nil {
+		ts = *blockTime
 	}
 
 	return &models.TokenFound{
 		Chain:          models.ChainSolana,
-		TokenAddress:   newMint,
-		FirstSeenTS:    blockTime,
-		CreatorAddress: creatorAddress,
+		TokenAddress:   mint,
+		FirstSeenTS:    ts,
+		CreatorAddress: creator,
 		TxHash:         txHash,
 		InitialLiquidity: models.InitialLiquidity{
 			Pair:          source,
