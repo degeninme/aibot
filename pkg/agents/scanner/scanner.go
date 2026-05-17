@@ -3,6 +3,7 @@ package scanner
 import (
 	"context"
 	"log"
+	"os"
 	"sync"
 	"time"
 
@@ -38,9 +39,13 @@ func (s *ChainScannerAgent) Start() {
 	s.wg.Add(1)
 	go s.scanSolana()
 	
-	// Start Base scanner
-	s.wg.Add(1)
-	go s.scanBase()
+	// Start Base scanner only if BASE_RPC_URL is configured
+	if os.Getenv("BASE_RPC_URL") != "" {
+		s.wg.Add(1)
+		go s.scanBase()
+	} else {
+		log.Println("ChainScannerAgent: BASE_RPC_URL not set, skipping Base chain scanning")
+	}
 	
 	log.Println("ChainScannerAgent: Chain monitoring started")
 }
