@@ -76,20 +76,17 @@ func base58Encode(b []byte) string {
 	return string(result)
 }
 
-// ─── QuickNode swap response types ────────────────────────────────────────────
+// ─── PumpPortal swap request ──────────────────────────────────────────────────
 
-type swapRequest struct {
-	Wallet           string `json:"wallet"`
-	Type             string `json:"type"`
-	Mint             string `json:"mint"`
-	InAmount         string `json:"inAmount"`
-	PriorityFeeLevel string `json:"priorityFeeLevel,omitempty"`
-	SlippageBps      string `json:"slippageBps,omitempty"`
-}
-
-type swapResponse struct {
-	Tx    string `json:"tx"`
-	Error string `json:"error,omitempty"`
+type pumpPortalRequest struct {
+	PublicKey         string  `json:"publicKey"`
+	Action            string  `json:"action"`
+	Mint              string  `json:"mint"`
+	Amount            float64 `json:"amount"`
+	DenominatedInSol  string  `json:"denominatedInSol"`
+	Slippage          float64 `json:"slippage"`
+	PriorityFee       float64 `json:"priorityFee"`
+	Pool              string  `json:"pool"`
 }
 
 // ─── Solana RPC types ─────────────────────────────────────────────────────────
@@ -121,6 +118,7 @@ type ExecutionAgent struct {
 // NewExecutionAgent creates a new execution agent
 func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
 	// Read Metis endpoint — accepts either METIS_URL (QuickNode standard) or QUICKNODE_URL
+	// Optional — PumpPortal is used by default since it's free and stays current
 	metisURL := os.Getenv("METIS_URL")
 	if metisURL == "" {
 		metisURL = os.Getenv("QUICKNODE_URL")
@@ -132,11 +130,7 @@ func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
 		quicknodeURL: strings.TrimRight(metisURL, "/"),
 	}
 
-	if agent.quicknodeURL == "" {
-		log.Println("ExecutionAgent: ⚠️  METIS_URL/QUICKNODE_URL not set — cannot execute real trades")
-	} else {
-		log.Printf("ExecutionAgent: Metis endpoint configured: %s\n", agent.quicknodeURL)
-	}
+	log.Println("ExecutionAgent: Using PumpPortal trade-local API (free, no key required)")
 
 	if cfg.PrivateKey != "" {
 		if err := agent.loadPrivateKey(cfg.PrivateKey); err != nil {
@@ -167,21 +161,23 @@ func (e *ExecutionAgent) loadPrivateKey(privKeyB58 string) error {
 	return nil
 }
 
-// ─── QuickNode API: get prebuilt swap transaction ────────────────────────────
+// ─── PumpPortal API: get prebuilt unsigned transaction ───────────────────────
+
+const PumpPortalURL = "https://pumpportal.fun/api/trade-local"
 
 func (e *ExecutionAgent) getSwapTransaction(mint string, lamports uint64) (string, error) {
-	if e.quicknodeURL == "" {
-		return "", fmt.Errorf("QUICKNODE_URL not configured")
-	}
-
 	walletPubkey := base58Encode(e.publicKey)
-	body := swapRequest{
-		Wallet:           walletPubkey,
-		Type:             "BUY",
+	solAmount := float64(lamports) / 1_000_000_000
+
+	body := pumpPortalRequest{
+		PublicKey:        walletPubkey,
+		Action:           "buy",
 		Mint:             mint,
-		InAmount:         fmt.Sprintf("%d", lamports),
-		PriorityFeeLevel: "high",
-		SlippageBps:      "5000", // 50% slippage tolerance (new tokens move fast)
+		Amount:           solAmount,
+		DenominatedInSol: "true",
+		Slippage:         10,      // 10% slippage tolerance
+		PriorityFee:      0.0005,  // 0.0005 SOL priority fee
+		Pool:             "pump",
 	}
 
 	jsonBody, err := json.Marshal(body)
@@ -189,11 +185,10 @@ func (e *ExecutionAgent) getSwapTransaction(mint string, lamports uint64) (strin
 		return "", fmt.Errorf("marshal: %w", err)
 	}
 
-	url := e.quicknodeURL + "/pump-fun/swap"
-	log.Printf("ExecutionAgent: POST %s wallet=%s mint=%s lamports=%d\n",
-		url, walletPubkey, mint, lamports)
+	log.Printf("ExecutionAgent: POST %s wallet=%s mint=%s sol=%.4f\n",
+		PumpPortalURL, walletPubkey, mint, solAmount)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	req, err := http.NewRequest("POST", PumpPortalURL, bytes.NewReader(jsonBody))
 	if err != nil {
 		return "", fmt.Errorf("request: %w", err)
 	}
@@ -214,18 +209,12 @@ func (e *ExecutionAgent) getSwapTransaction(mint string, lamports uint64) (strin
 		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
 	}
 
-	var sr swapResponse
-	if err := json.Unmarshal(respBody, &sr); err != nil {
-		return "", fmt.Errorf("unmarshal: %w (body: %s)", err, string(respBody))
-	}
-	if sr.Error != "" {
-		return "", fmt.Errorf("quicknode error: %s", sr.Error)
-	}
-	if sr.Tx == "" {
-		return "", fmt.Errorf("empty tx in response: %s", string(respBody))
+	// PumpPortal returns RAW transaction bytes (not JSON), encode as base64
+	if len(respBody) < 65 {
+		return "", fmt.Errorf("response too short (%d bytes): %s", len(respBody), string(respBody))
 	}
 
-	return sr.Tx, nil
+	return base64.StdEncoding.EncodeToString(respBody), nil
 }
 
 // ─── Sign and send the prebuilt transaction ──────────────────────────────────
@@ -344,9 +333,6 @@ func (e *ExecutionAgent) sendTransaction(txB64 string) (string, error) {
 func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmount float64) (string, error) {
 	if e.privateKey == nil {
 		return "", fmt.Errorf("no private key configured")
-	}
-	if e.quicknodeURL == "" {
-		return "", fmt.Errorf("QUICKNODE_URL env var not set")
 	}
 
 	lamports := uint64(solAmount * 1_000_000_000)
