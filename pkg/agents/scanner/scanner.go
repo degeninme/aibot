@@ -1,8 +1,13 @@
 package scanner
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"fmt"
+	"io"
 	"log"
+	"net/http"
 	"os"
 	"sync"
 	"time"
@@ -11,6 +16,69 @@ import (
 	"github.com/mumugogoing/meme_bot/pkg/models"
 )
 
+// Well-known Solana program addresses
+const (
+	// PumpFun program - most memecoins launch here
+	PumpFunProgram = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
+	// Raydium AMM v4 - liquidity pools
+	RaydiumAMMProgram = "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8"
+)
+
+// JSON-RPC request/response types
+type rpcRequest struct {
+	Jsonrpc string        `json:"jsonrpc"`
+	ID      int           `json:"id"`
+	Method  string        `json:"method"`
+	Params  []interface{} `json:"params"`
+}
+
+type rpcResponse struct {
+	Jsonrpc string          `json:"jsonrpc"`
+	ID      int             `json:"id"`
+	Result  json.RawMessage `json:"result"`
+	Error   *rpcError       `json:"error,omitempty"`
+}
+
+type rpcError struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+type signatureInfo struct {
+	Signature string      `json:"signature"`
+	Slot      uint64      `json:"slot"`
+	Err       interface{} `json:"err"`
+	BlockTime *int64      `json:"blockTime"`
+}
+
+type txResult struct {
+	Transaction struct {
+		Message struct {
+			AccountKeys  []string `json:"accountKeys"`
+			Instructions []struct {
+				ProgramIDIndex int    `json:"programIdIndex"`
+				Data           string `json:"data"`
+			} `json:"instructions"`
+		} `json:"message"`
+	} `json:"transaction"`
+	Meta struct {
+		PostTokenBalances []tokenBalance `json:"postTokenBalances"`
+		PreTokenBalances  []tokenBalance `json:"preTokenBalances"`
+		LogMessages       []string       `json:"logMessages"`
+		Err               interface{}    `json:"err"`
+	} `json:"meta"`
+	BlockTime *int64 `json:"blockTime"`
+}
+
+type tokenBalance struct {
+	AccountIndex int    `json:"accountIndex"`
+	Mint         string `json:"mint"`
+	Owner        string `json:"owner"`
+	UITokenAmount struct {
+		UIAmount float64 `json:"uiAmount"`
+	} `json:"uiTokenAmount"`
+}
+
 // ChainScannerAgent monitors on-chain events for new tokens
 type ChainScannerAgent struct {
 	config       *config.Config
@@ -18,6 +86,9 @@ type ChainScannerAgent struct {
 	ctx          context.Context
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
+	httpClient   *http.Client
+	seenSigs     map[string]bool
+	seenSigsMu   sync.Mutex
 }
 
 // NewChainScannerAgent creates a new chain scanner agent
@@ -28,25 +99,25 @@ func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
 		tokenChannel: make(chan models.TokenFound, 100),
 		ctx:          ctx,
 		cancel:       cancel,
+		httpClient:   &http.Client{Timeout: 15 * time.Second},
+		seenSigs:     make(map[string]bool),
 	}
 }
 
 // Start begins scanning both chains
 func (s *ChainScannerAgent) Start() {
 	log.Println("ChainScannerAgent: Starting chain monitoring...")
-	
-	// Start Solana scanner
+
 	s.wg.Add(1)
 	go s.scanSolana()
-	
-	// Start Base scanner only if BASE_RPC_URL is configured
+
 	if os.Getenv("BASE_RPC_URL") != "" {
 		s.wg.Add(1)
 		go s.scanBase()
 	} else {
 		log.Println("ChainScannerAgent: BASE_RPC_URL not set, skipping Base chain scanning")
 	}
-	
+
 	log.Println("ChainScannerAgent: Chain monitoring started")
 }
 
@@ -64,15 +135,11 @@ func (s *ChainScannerAgent) GetTokenChannel() <-chan models.TokenFound {
 	return s.tokenChannel
 }
 
-// scanSolana monitors Solana chain for new tokens
 func (s *ChainScannerAgent) scanSolana() {
 	defer s.wg.Done()
-	
 	ticker := time.NewTicker(s.config.ScanIntervalSolana)
 	defer ticker.Stop()
-	
 	log.Printf("ChainScannerAgent: Solana scanner started (interval: %v)\n", s.config.ScanIntervalSolana)
-	
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -83,15 +150,11 @@ func (s *ChainScannerAgent) scanSolana() {
 	}
 }
 
-// scanBase monitors Base chain for new tokens
 func (s *ChainScannerAgent) scanBase() {
 	defer s.wg.Done()
-	
 	ticker := time.NewTicker(s.config.ScanIntervalBase)
 	defer ticker.Stop()
-	
 	log.Printf("ChainScannerAgent: Base scanner started (interval: %v)\n", s.config.ScanIntervalBase)
-	
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -102,50 +165,237 @@ func (s *ChainScannerAgent) scanBase() {
 	}
 }
 
-// scanSolanaNewTokens scans for new tokens on Solana
-func (s *ChainScannerAgent) scanSolanaNewTokens() {
-	// TODO: Implement actual Solana RPC scanning
-	// - Monitor program logs for token creation events
-	// - Parse transaction data for new mint addresses
-	// - Check for liquidity pool creation (Raydium, Orca)
-	// - Extract initial liquidity and creator info
-	
-	log.Println("ChainScannerAgent: Scanning Solana for new tokens...")
-	
-	// Placeholder: This would connect to Solana RPC and monitor events
-	// Example implementation would:
-	// 1. Use getProgramAccounts to find new SPL Token mints
-	// 2. Monitor Raydium/Orca factory contracts for pool creation
-	// 3. Parse transaction signatures for relevant events
-	
-	// For now, this is a stub that would be replaced with actual implementation
+// rpcCall makes a JSON-RPC call to the Solana RPC endpoint
+func (s *ChainScannerAgent) rpcCall(method string, params []interface{}) (*rpcResponse, error) {
+	req := rpcRequest{Jsonrpc: "2.0", ID: 1, Method: method, Params: params}
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(s.ctx, "POST", s.config.SolanaRPCURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var rpcResp rpcResponse
+	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+		return nil, err
+	}
+	if rpcResp.Error != nil {
+		return nil, fmt.Errorf("RPC error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	}
+	return &rpcResp, nil
 }
 
-// scanBaseNewTokens scans for new tokens on Base
+// getRecentSignatures fetches recent signatures for a program address
+func (s *ChainScannerAgent) getRecentSignatures(programID string, limit int) ([]signatureInfo, error) {
+	resp, err := s.rpcCall("getSignaturesForAddress", []interface{}{
+		programID,
+		map[string]interface{}{"limit": limit, "commitment": "confirmed"},
+	})
+	if err != nil {
+		return nil, err
+	}
+	var sigs []signatureInfo
+	if err := json.Unmarshal(resp.Result, &sigs); err != nil {
+		return nil, err
+	}
+	return sigs, nil
+}
+
+// getTransaction fetches a full transaction by signature
+func (s *ChainScannerAgent) getTransaction(sig string) (*txResult, error) {
+	resp, err := s.rpcCall("getTransaction", []interface{}{
+		sig,
+		map[string]interface{}{
+			"encoding":                       "json",
+			"maxSupportedTransactionVersion": 0,
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+	if string(resp.Result) == "null" {
+		return nil, nil
+	}
+	var tx txResult
+	if err := json.Unmarshal(resp.Result, &tx); err != nil {
+		return nil, err
+	}
+	return &tx, nil
+}
+
+// scanSolanaNewTokens scans PumpFun and Raydium for new token launches
+func (s *ChainScannerAgent) scanSolanaNewTokens() {
+	log.Println("ChainScannerAgent: Scanning Solana for new tokens...")
+	s.scanProgram(PumpFunProgram, "pumpfun", 10)
+	s.scanProgram(RaydiumAMMProgram, "raydium", 5)
+}
+
+// scanProgram scans a specific Solana program for new token events
+func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
+	sigs, err := s.getRecentSignatures(programID, limit)
+	if err != nil {
+		log.Printf("ChainScannerAgent: Error fetching %s signatures: %v\n", source, err)
+		return
+	}
+
+	for _, sig := range sigs {
+		if sig.Err != nil {
+			continue
+		}
+
+		s.seenSigsMu.Lock()
+		seen := s.seenSigs[sig.Signature]
+		if !seen {
+			s.seenSigs[sig.Signature] = true
+			if len(s.seenSigs) > 5000 {
+				s.pruneSeen()
+			}
+		}
+		s.seenSigsMu.Unlock()
+
+		if seen {
+			continue
+		}
+
+		tx, err := s.getTransaction(sig.Signature)
+		if err != nil {
+			log.Printf("ChainScannerAgent: Error fetching tx %s: %v\n", sig.Signature, err)
+			continue
+		}
+		if tx == nil || tx.Meta.Err != nil {
+			continue
+		}
+
+		token := s.extractTokenFromTx(tx, sig.Signature, source)
+		if token != nil {
+			log.Printf("ChainScannerAgent: 🚀 New token found via %s! Mint: %s\n", source, token.TokenAddress)
+			s.emitTokenFound(*token)
+		}
+	}
+}
+
+// extractTokenFromTx parses a transaction and extracts new token info
+func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source string) *models.TokenFound {
+	accounts := tx.Transaction.Message.AccountKeys
+	if len(accounts) == 0 {
+		return nil
+	}
+
+	// Find new mints: in postTokenBalances but not in preTokenBalances
+	preMints := make(map[string]bool)
+	for _, bal := range tx.Meta.PreTokenBalances {
+		preMints[bal.Mint] = true
+	}
+
+	var newMint, creatorAddress string
+	var reserveToken float64
+
+	for _, bal := range tx.Meta.PostTokenBalances {
+		if !preMints[bal.Mint] && bal.Mint != "" {
+			newMint = bal.Mint
+			reserveToken = bal.UITokenAmount.UIAmount
+			if bal.Owner != "" {
+				creatorAddress = bal.Owner
+			}
+			break
+		}
+	}
+
+	if newMint == "" {
+		return nil
+	}
+
+	// Fallback: use fee payer as creator
+	if creatorAddress == "" && len(accounts) > 0 {
+		creatorAddress = accounts[0]
+	}
+
+	// Estimate SOL reserve from log messages
+	reserveNative := s.estimateSOLReserve(tx.Meta.LogMessages)
+
+	// Filter by minimum liquidity (rough USD estimate at ~$150/SOL)
+	if reserveNative > 0 {
+		liquidityUSD := reserveNative * 150.0
+		if liquidityUSD < s.config.MinLiquidity {
+			log.Printf("ChainScannerAgent: Skipping %s - liquidity $%.2f below minimum $%.2f\n",
+				newMint, liquidityUSD, s.config.MinLiquidity)
+			return nil
+		}
+	}
+
+	blockTime := time.Now().Unix()
+	if tx.BlockTime != nil {
+		blockTime = *tx.BlockTime
+	}
+
+	return &models.TokenFound{
+		Chain:          models.ChainSolana,
+		TokenAddress:   newMint,
+		FirstSeenTS:    blockTime,
+		CreatorAddress: creatorAddress,
+		TxHash:         txHash,
+		InitialLiquidity: models.InitialLiquidity{
+			Pair:          source,
+			ReserveToken:  reserveToken,
+			ReserveNative: reserveNative,
+		},
+		Metadata: map[string]string{
+			"source": source,
+		},
+	}
+}
+
+// estimateSOLReserve tries to parse SOL amounts from PumpFun log messages
+func (s *ChainScannerAgent) estimateSOLReserve(logs []string) float64 {
+	for _, msg := range logs {
+		var amount float64
+		if n, _ := fmt.Sscanf(msg, "Program log: sol_amount: %f", &amount); n == 1 {
+			return amount / 1e9
+		}
+		if n, _ := fmt.Sscanf(msg, "Program log: virtual_sol_reserves: %f", &amount); n == 1 {
+			return amount / 1e9
+		}
+	}
+	return 0
+}
+
+// pruneSeen removes half the seen signatures to keep memory bounded
+func (s *ChainScannerAgent) pruneSeen() {
+	count := 0
+	for k := range s.seenSigs {
+		delete(s.seenSigs, k)
+		count++
+		if count >= 2500 {
+			break
+		}
+	}
+}
+
+// scanBaseNewTokens - stub, Base scanning disabled when BASE_RPC_URL is unset
 func (s *ChainScannerAgent) scanBaseNewTokens() {
-	// TODO: Implement actual Base (EVM) scanning
-	// - Monitor Uniswap V2/V3 factory events
-	// - Track PairCreated events
-	// - Parse token metadata from ERC20 contracts
-	// - Extract initial liquidity from pool reserves
-	
 	log.Println("ChainScannerAgent: Scanning Base for new tokens...")
-	
-	// Placeholder: This would connect to Base RPC and monitor events
-	// Example implementation would:
-	// 1. Subscribe to PairCreated events from Uniswap factory
-	// 2. Parse event logs for new token addresses
-	// 3. Query initial reserves from the pair contract
-	// 4. Get token metadata (name, symbol, decimals)
-	
-	// For now, this is a stub that would be replaced with actual implementation
 }
 
 // emitTokenFound sends a discovered token to the channel
 func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
 	select {
 	case s.tokenChannel <- token:
-		log.Printf("ChainScannerAgent: Token found - %s on %s\n", token.TokenAddress, token.Chain)
+		log.Printf("ChainScannerAgent: Token emitted - %s on %s\n", token.TokenAddress, token.Chain)
 	case <-s.ctx.Done():
 		return
 	default:
