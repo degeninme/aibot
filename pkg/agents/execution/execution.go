@@ -401,6 +401,32 @@ func (e *ExecutionAgent) sendTransaction(txB64 string) (string, error) {
 	return txHash, nil
 }
 
+
+// getAssocBondingCurve fetches the associated bonding curve token account
+// by querying the token accounts owned by the bonding curve for the given mint
+func (e *ExecutionAgent) getAssocBondingCurve(bondingCurve, mint string) (string, error) {
+	result, err := e.rpcCall("getTokenAccountsByOwner", []interface{}{
+		bondingCurve,
+		map[string]string{"mint": mint},
+		map[string]string{"encoding": "base64"},
+	})
+	if err != nil {
+		return "", err
+	}
+	var out struct {
+		Value []struct {
+			Pubkey string `json:"pubkey"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(result, &out); err != nil {
+		return "", fmt.Errorf("parse token accounts: %w", err)
+	}
+	if len(out.Value) == 0 {
+		return "", fmt.Errorf("no token account found for bondingCurve %s mint %s", bondingCurve, mint)
+	}
+	return out.Value[0].Pubkey, nil
+}
+
 func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmount float64) (string, error) {
 	if e.privateKey == nil {
 		return "", fmt.Errorf("no private key configured — set PRIVATE_KEY env var")
@@ -431,11 +457,11 @@ func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmoun
 	}
 	bondingCurve := base58Encode(bondingCurveBytes)
 
-	assocBCBytes, err := deriveATA(bondingCurveBytes, mintBytes, tokenProgBytes)
+	// Fetch assocBondingCurve from RPC — find the token account owned by bondingCurve for this mint
+	assocBondingCurve, err := e.getAssocBondingCurve(bondingCurve, mint)
 	if err != nil {
-		return "", fmt.Errorf("assocBondingCurve ATA: %w", err)
+		return "", fmt.Errorf("assocBondingCurve lookup: %w", err)
 	}
-	assocBondingCurve := base58Encode(assocBCBytes)
 
 	walletBytes := mustDecode58(walletPubkey)
 	userATABytes, err := deriveATA(walletBytes, mintBytes, tokenProgBytes)
