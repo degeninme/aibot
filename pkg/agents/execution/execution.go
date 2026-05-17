@@ -120,16 +120,22 @@ type ExecutionAgent struct {
 
 // NewExecutionAgent creates a new execution agent
 func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
+	// Read Metis endpoint — accepts either METIS_URL (QuickNode standard) or QUICKNODE_URL
+	metisURL := os.Getenv("METIS_URL")
+	if metisURL == "" {
+		metisURL = os.Getenv("QUICKNODE_URL")
+	}
+
 	agent := &ExecutionAgent{
 		config:       cfg,
 		httpClient:   &http.Client{Timeout: 30 * time.Second},
-		quicknodeURL: strings.TrimRight(os.Getenv("QUICKNODE_URL"), "/"),
+		quicknodeURL: strings.TrimRight(metisURL, "/"),
 	}
 
 	if agent.quicknodeURL == "" {
-		log.Println("ExecutionAgent: ⚠️  QUICKNODE_URL not set — cannot execute real trades")
+		log.Println("ExecutionAgent: ⚠️  METIS_URL/QUICKNODE_URL not set — cannot execute real trades")
 	} else {
-		log.Printf("ExecutionAgent: QuickNode endpoint configured\n")
+		log.Printf("ExecutionAgent: Metis endpoint configured: %s\n", agent.quicknodeURL)
 	}
 
 	if cfg.PrivateKey != "" {
