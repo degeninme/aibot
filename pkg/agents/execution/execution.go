@@ -4,35 +4,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/ed25519"
-	"crypto/sha256"
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
 	"log"
 	"math/big"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/mumugogoing/meme_bot/pkg/config"
 	"github.com/mumugogoing/meme_bot/pkg/models"
 )
-
-// ─── PumpFun constants ────────────────────────────────────────────────────────
-const (
-	PumpFunProgram      = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-	PumpFunFeeRecipient = "CebN5WGQ4jvEPvsVU4EoHEpgznyQHeAoceR5oHAjXHN"
-	PumpFunGlobal       = "" // derived at runtime via deriveGlobalPDA()
-	PumpFunEventAuth    = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F"
-	SystemProgram       = "11111111111111111111111111111111"
-	Token2022Program    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
-	AssocTokenProgram   = "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJe1bWB"
-	RentSysvar          = "SysvarRent111111111111111111111111111111111"
-)
-
-// Anchor discriminator for "buy": sha256("global:buy")[0:8]
-var buyDiscriminator = []byte{102, 6, 61, 18, 1, 218, 235, 234}
 
 // ─── Base58 using math/big ────────────────────────────────────────────────────
 const base58Alphabet = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -56,10 +40,7 @@ func base58Decode(s string) ([]byte, error) {
 		n.Mul(n, bigBase)
 		n.Add(n, big.NewInt(int64(idx)))
 	}
-
 	decoded := n.Bytes()
-
-	// Count leading '1's → leading zero bytes
 	leading := 0
 	for _, c := range s {
 		if c == '1' {
@@ -94,81 +75,24 @@ func base58Encode(b []byte) string {
 	return string(result)
 }
 
-func mustDecode58(s string) []byte {
-	b, err := base58Decode(s)
-	if err != nil {
-		panic(fmt.Sprintf("invalid base58 %q: %v", s, err))
-	}
-	if len(b) < 32 {
-		padded := make([]byte, 32)
-		copy(padded[32-len(b):], b)
-		return padded
-	}
-	return b[:32]
+// ─── QuickNode swap response types ────────────────────────────────────────────
+
+type swapRequest struct {
+	Wallet           string `json:"wallet"`
+	Type             string `json:"type"`
+	Mint             string `json:"mint"`
+	InAmount         string `json:"inAmount"`
+	PriorityFeeLevel string `json:"priorityFeeLevel,omitempty"`
+	SlippageBps      string `json:"slippageBps,omitempty"`
 }
 
-// ─── PDA derivation (pure Go, no external deps) ───────────────────────────────
-
-// findProgramAddress derives a PDA using the standard Solana algorithm
-func findProgramAddress(seeds [][]byte, programID []byte) ([]byte, uint8, error) {
-	for nonce := uint8(255); ; nonce-- {
-		seedsWithNonce := append(seeds, []byte{nonce})
-		addr, err := createProgramAddress(seedsWithNonce, programID)
-		if err != nil {
-			if nonce == 0 {
-				return nil, 0, fmt.Errorf("could not find program address")
-			}
-			continue
-		}
-		return addr, nonce, nil
-	}
+type swapResponse struct {
+	Tx    string `json:"tx"`
+	Error string `json:"error,omitempty"`
 }
 
-// createProgramAddress creates a program address from seeds
-func createProgramAddress(seeds [][]byte, programID []byte) ([]byte, error) {
-	h := sha256.New()
-	for _, seed := range seeds {
-		h.Write(seed)
-	}
-	h.Write(programID)
-	h.Write([]byte("ProgramDerivedAddress"))
-	hash := h.Sum(nil)
+// ─── Solana RPC types ─────────────────────────────────────────────────────────
 
-	// Check it's not on the ed25519 curve (valid PDA must be off-curve)
-	// Simple check: if it decodes as a valid curve point, reject
-	// For our purposes we just return it — the nonce loop handles off-curve
-	return hash, nil
-}
-
-
-// deriveGlobalPDA derives the PumpFun global state PDA from seed "global"
-func deriveGlobalPDA() ([]byte, error) {
-	programID := mustDecode58(PumpFunProgram)
-	seeds := [][]byte{[]byte("global")}
-	addr, _, err := findProgramAddress(seeds, programID)
-	return addr, err
-}
-
-// deriveBondingCurvePDA derives the bonding curve PDA for a mint
-func deriveBondingCurvePDA(mint []byte) ([]byte, error) {
-	programID := mustDecode58(PumpFunProgram)
-	seeds := [][]byte{
-		[]byte("bonding-curve"),
-		mint,
-	}
-	addr, _, err := findProgramAddress(seeds, programID)
-	return addr, err
-}
-
-// deriveATA derives the associated token account address
-func deriveATA(wallet, mint []byte, tokenProgram []byte) ([]byte, error) {
-	programID := mustDecode58(AssocTokenProgram)
-	seeds := [][]byte{wallet, tokenProgram, mint}
-	addr, _, err := findProgramAddress(seeds, programID)
-	return addr, err
-}
-
-// ─── RPC types ────────────────────────────────────────────────────────────────
 type rpcReq struct {
 	Jsonrpc string        `json:"jsonrpc"`
 	ID      int           `json:"id"`
@@ -184,20 +108,29 @@ type rpcResp struct {
 	} `json:"error"`
 }
 
-// ExecutionAgent handles trade execution
+// ExecutionAgent handles trade execution via QuickNode's PumpFun API
 type ExecutionAgent struct {
-	config     *config.Config
-	httpClient *http.Client
-	privateKey ed25519.PrivateKey
-	publicKey  ed25519.PublicKey
+	config       *config.Config
+	httpClient   *http.Client
+	privateKey   ed25519.PrivateKey
+	publicKey    ed25519.PublicKey
+	quicknodeURL string
 }
 
 // NewExecutionAgent creates a new execution agent
 func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
 	agent := &ExecutionAgent{
-		config:     cfg,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
+		config:       cfg,
+		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		quicknodeURL: os.Getenv("QUICKNODE_URL"),
 	}
+
+	if agent.quicknodeURL == "" {
+		log.Println("ExecutionAgent: ⚠️  QUICKNODE_URL not set — cannot execute real trades")
+	} else {
+		log.Printf("ExecutionAgent: QuickNode endpoint configured\n")
+	}
+
 	if cfg.PrivateKey != "" {
 		if err := agent.loadPrivateKey(cfg.PrivateKey); err != nil {
 			log.Printf("ExecutionAgent: Failed to load private key: %v\n", err)
@@ -205,7 +138,7 @@ func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
 			log.Printf("ExecutionAgent: Wallet loaded: %s\n", base58Encode(agent.publicKey))
 		}
 	} else {
-		log.Println("ExecutionAgent: No PRIVATE_KEY set — running in observe-only mode")
+		log.Println("ExecutionAgent: No PRIVATE_KEY set — observe-only mode")
 	}
 	return agent
 }
@@ -227,6 +160,105 @@ func (e *ExecutionAgent) loadPrivateKey(privKeyB58 string) error {
 	return nil
 }
 
+// ─── QuickNode API: get prebuilt swap transaction ────────────────────────────
+
+func (e *ExecutionAgent) getSwapTransaction(mint string, lamports uint64) (string, error) {
+	if e.quicknodeURL == "" {
+		return "", fmt.Errorf("QUICKNODE_URL not configured")
+	}
+
+	walletPubkey := base58Encode(e.publicKey)
+	body := swapRequest{
+		Wallet:           walletPubkey,
+		Type:             "BUY",
+		Mint:             mint,
+		InAmount:         fmt.Sprintf("%d", lamports),
+		PriorityFeeLevel: "high",
+		SlippageBps:      "500", // 5% slippage tolerance
+	}
+
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return "", fmt.Errorf("marshal: %w", err)
+	}
+
+	url := e.quicknodeURL + "/pump-fun/swap"
+	log.Printf("ExecutionAgent: POST %s wallet=%s mint=%s lamports=%d\n",
+		url, walletPubkey, mint, lamports)
+
+	req, err := http.NewRequest("POST", url, bytes.NewReader(jsonBody))
+	if err != nil {
+		return "", fmt.Errorf("request: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := e.httpClient.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("http: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", fmt.Errorf("read: %w", err)
+	}
+
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("HTTP %d: %s", resp.StatusCode, string(respBody))
+	}
+
+	var sr swapResponse
+	if err := json.Unmarshal(respBody, &sr); err != nil {
+		return "", fmt.Errorf("unmarshal: %w (body: %s)", err, string(respBody))
+	}
+	if sr.Error != "" {
+		return "", fmt.Errorf("quicknode error: %s", sr.Error)
+	}
+	if sr.Tx == "" {
+		return "", fmt.Errorf("empty tx in response: %s", string(respBody))
+	}
+
+	return sr.Tx, nil
+}
+
+// ─── Sign and send the prebuilt transaction ──────────────────────────────────
+
+// signTransaction signs a base64-encoded unsigned (or partially signed) transaction
+// QuickNode returns a transaction with an empty signature slot — we fill it in
+func (e *ExecutionAgent) signTransaction(txB64 string) (string, error) {
+	txBytes, err := base64.StdEncoding.DecodeString(txB64)
+	if err != nil {
+		return "", fmt.Errorf("base64 decode: %w", err)
+	}
+
+	if len(txBytes) < 1 {
+		return "", fmt.Errorf("tx too short")
+	}
+
+	// Solana wire format: [numSignatures (1 byte)][signatures (64 bytes each)][message]
+	numSigs := int(txBytes[0])
+	if numSigs < 1 {
+		return "", fmt.Errorf("no signature slots in tx")
+	}
+
+	sigStart := 1
+	msgStart := sigStart + numSigs*64
+	if len(txBytes) < msgStart {
+		return "", fmt.Errorf("tx truncated: expected %d bytes, got %d", msgStart, len(txBytes))
+	}
+
+	message := txBytes[msgStart:]
+	signature := ed25519.Sign(e.privateKey, message)
+
+	// Place signature in the first slot (fee payer is always first signer)
+	signedTx := make([]byte, len(txBytes))
+	copy(signedTx, txBytes)
+	copy(signedTx[sigStart:sigStart+64], signature)
+
+	return base64.StdEncoding.EncodeToString(signedTx), nil
+}
+
+// rpcCall makes a Solana JSON-RPC call (for sending the signed tx)
 func (e *ExecutionAgent) rpcCall(method string, params []interface{}) (json.RawMessage, error) {
 	req := rpcReq{Jsonrpc: "2.0", ID: 1, Method: method, Params: params}
 	body, _ := json.Marshal(req)
@@ -252,119 +284,6 @@ func (e *ExecutionAgent) rpcCall(method string, params []interface{}) (json.RawM
 		return nil, fmt.Errorf("RPC %s error %d: %s", method, rr.Error.Code, rr.Error.Message)
 	}
 	return rr.Result, nil
-}
-
-func (e *ExecutionAgent) getRecentBlockhash() (string, error) {
-	result, err := e.rpcCall("getLatestBlockhash", []interface{}{
-		map[string]string{"commitment": "confirmed"},
-	})
-	if err != nil {
-		return "", err
-	}
-	var out struct {
-		Value struct {
-			Blockhash string `json:"blockhash"`
-		} `json:"value"`
-	}
-	if err := json.Unmarshal(result, &out); err != nil {
-		return "", err
-	}
-	return out.Value.Blockhash, nil
-}
-
-// buildBuyInstructionData builds raw PumpFun buy instruction bytes
-func buildBuyInstructionData(tokenAmount, maxSolCost uint64) []byte {
-	data := make([]byte, 24)
-	copy(data[0:8], buyDiscriminator)
-	binary.LittleEndian.PutUint64(data[8:16], tokenAmount)
-	binary.LittleEndian.PutUint64(data[16:24], maxSolCost)
-	return data
-}
-
-// compactU16 encodes a length as Solana compact-u16
-func compactU16(n int) []byte {
-	if n <= 0x7f {
-		return []byte{byte(n)}
-	}
-	return []byte{byte(n&0x7f | 0x80), byte(n >> 7)}
-}
-
-// Instruction represents a single Solana instruction
-type Instruction struct {
-	ProgramID string
-	Accounts  []string
-	Data      []byte
-}
-
-// buildTransaction builds a signed legacy Solana transaction with multiple instructions
-func (e *ExecutionAgent) buildTransaction(
-	blockhash string,
-	instructions []Instruction,
-) (string, error) {
-	feePayer := base58Encode(e.publicKey)
-
-	// Collect all unique account keys, starting with feePayer
-	keyOrder := []string{feePayer}
-	keySet := map[string]int{feePayer: 0}
-	for _, ix := range instructions {
-		for _, acc := range ix.Accounts {
-			if _, ok := keySet[acc]; !ok {
-				keySet[acc] = len(keyOrder)
-				keyOrder = append(keyOrder, acc)
-			}
-		}
-		if _, ok := keySet[ix.ProgramID]; !ok {
-			keySet[ix.ProgramID] = len(keyOrder)
-			keyOrder = append(keyOrder, ix.ProgramID)
-		}
-	}
-
-	// Message header: numRequiredSigs=1, numReadonlySignedAccounts=0, numReadonlyUnsignedAccounts=len-1
-	header := []byte{1, 0, byte(len(keyOrder) - 1)}
-
-	// Account addresses
-	addrBuf := make([]byte, 0, len(keyOrder)*32)
-	for _, k := range keyOrder {
-		addrBuf = append(addrBuf, mustDecode58(k)...)
-	}
-
-	// Blockhash
-	bhBytes := mustDecode58(blockhash)
-
-	// Build all instructions
-	allInstrBytes := []byte{}
-	for _, ix := range instructions {
-		instrAccIdxs := make([]byte, len(ix.Accounts))
-		for i, acc := range ix.Accounts {
-			instrAccIdxs[i] = byte(keySet[acc])
-		}
-		progIdx := byte(keySet[ix.ProgramID])
-
-		allInstrBytes = append(allInstrBytes, progIdx)
-		allInstrBytes = append(allInstrBytes, compactU16(len(instrAccIdxs))...)
-		allInstrBytes = append(allInstrBytes, instrAccIdxs...)
-		allInstrBytes = append(allInstrBytes, compactU16(len(ix.Data))...)
-		allInstrBytes = append(allInstrBytes, ix.Data...)
-	}
-
-	// Full message
-	msg := []byte{}
-	msg = append(msg, header...)
-	msg = append(msg, compactU16(len(keyOrder))...)
-	msg = append(msg, addrBuf...)
-	msg = append(msg, bhBytes...)
-	msg = append(msg, compactU16(len(instructions))...)
-	msg = append(msg, allInstrBytes...)
-
-	// Sign
-	sig := ed25519.Sign(e.privateKey, msg)
-
-	// Transaction wire format: [numSigs][sig][message]
-	tx := []byte{1}
-	tx = append(tx, sig...)
-	tx = append(tx, msg...)
-
-	return base64.StdEncoding.EncodeToString(tx), nil
 }
 
 func (e *ExecutionAgent) simulateTransaction(txB64 string) error {
@@ -413,162 +332,41 @@ func (e *ExecutionAgent) sendTransaction(txB64 string) (string, error) {
 	return txHash, nil
 }
 
-
-// getAssocBondingCurve fetches the associated bonding curve token account
-// by querying the token accounts owned by the bonding curve for the given mint
-func (e *ExecutionAgent) getAssocBondingCurve(bondingCurve, mint string) (string, error) {
-	// Try with Token2022 program first (PumpFun uses Token2022)
-	for _, tokenProg := range []string{Token2022Program, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"} {
-		result, err := e.rpcCall("getTokenAccountsByOwner", []interface{}{
-			bondingCurve,
-			map[string]string{"programId": tokenProg},
-			map[string]string{"encoding": "base64"},
-		})
-		if err != nil {
-			log.Printf("ExecutionAgent: getTokenAccountsByOwner (programId=%s) error: %v\n", tokenProg, err)
-			continue
-		}
-		var out struct {
-			Value []struct {
-				Pubkey  string `json:"pubkey"`
-				Account struct {
-					Data []string `json:"data"`
-				} `json:"account"`
-			} `json:"value"`
-		}
-		if err := json.Unmarshal(result, &out); err != nil {
-			log.Printf("ExecutionAgent: parse token accounts error: %v\n", err)
-			continue
-		}
-		// Find the one matching our mint
-		mintBytes := mustDecode58(mint)
-		for _, acc := range out.Value {
-			if len(acc.Account.Data) < 1 {
-				continue
-			}
-			dataBytes, err := base64.StdEncoding.DecodeString(acc.Account.Data[0])
-			if err != nil || len(dataBytes) < 32 {
-				continue
-			}
-			// First 32 bytes of token account data is the mint
-			if bytes.Equal(dataBytes[0:32], mintBytes) {
-				log.Printf("ExecutionAgent: Found assocBondingCurve via %s: %s\n", tokenProg, acc.Pubkey)
-				return acc.Pubkey, nil
-			}
-		}
-	}
-	return "", fmt.Errorf("no token account found for bondingCurve=%s mint=%s", bondingCurve, mint)
-}
+// ─── The actual buy flow ──────────────────────────────────────────────────────
 
 func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmount float64) (string, error) {
 	if e.privateKey == nil {
-		return "", fmt.Errorf("no private key configured — set PRIVATE_KEY env var")
+		return "", fmt.Errorf("no private key configured")
+	}
+	if e.quicknodeURL == "" {
+		return "", fmt.Errorf("QUICKNODE_URL env var not set")
 	}
 
-	walletPubkey := base58Encode(e.publicKey)
 	lamports := uint64(solAmount * 1_000_000_000)
-	maxSolCost := uint64(float64(lamports) * 1.01) // 1% slippage
-
 	log.Printf("ExecutionAgent: Buying mint=%s sol=%.4f lamports=%d\n", mint, solAmount, lamports)
 
-	// Derive global PDA
-	globalBytes, err := deriveGlobalPDA()
+	// 1. Get prebuilt transaction from QuickNode
+	txB64, err := e.getSwapTransaction(mint, lamports)
 	if err != nil {
-		return "", fmt.Errorf("deriveGlobalPDA: %w", err)
+		return "", fmt.Errorf("getSwapTransaction: %w", err)
 	}
-	pumpFunGlobal := base58Encode(globalBytes)
-	log.Printf("ExecutionAgent: global=%s\n", pumpFunGlobal)
+	log.Println("ExecutionAgent: Got prebuilt tx from QuickNode")
 
-	// Derive accounts
-	mintBytes := mustDecode58(mint)
-	tokenProgBytes := mustDecode58(Token2022Program)
-	programBytes := mustDecode58(PumpFunProgram)
-
-	bondingCurveBytes, err := deriveBondingCurvePDA(mintBytes)
+	// 2. Sign it with our private key
+	signedTx, err := e.signTransaction(txB64)
 	if err != nil {
-		return "", fmt.Errorf("bondingCurve PDA: %w", err)
+		return "", fmt.Errorf("signTransaction: %w", err)
 	}
-	bondingCurve := base58Encode(bondingCurveBytes)
+	log.Println("ExecutionAgent: Transaction signed")
 
-	// Fetch assocBondingCurve from RPC — find the token account owned by bondingCurve for this mint
-	assocBondingCurve, err := e.getAssocBondingCurve(bondingCurve, mint)
-	if err != nil {
-		return "", fmt.Errorf("assocBondingCurve lookup: %w", err)
-	}
-
-	walletBytes := mustDecode58(walletPubkey)
-	userATABytes, err := deriveATA(walletBytes, mintBytes, tokenProgBytes)
-	if err != nil {
-		return "", fmt.Errorf("userATA: %w", err)
-	}
-	userATA := base58Encode(userATABytes)
-
-	_ = programBytes // used implicitly via PumpFunProgram constant
-
-	log.Printf("ExecutionAgent: bondingCurve=%s\n", bondingCurve)
-	log.Printf("ExecutionAgent: assocBondingCurve=%s\n", assocBondingCurve)
-	log.Printf("ExecutionAgent: userATA=%s\n", userATA)
-
-	// Get blockhash
-	blockhash, err := e.getRecentBlockhash()
-	if err != nil {
-		return "", fmt.Errorf("getRecentBlockhash: %w", err)
-	}
-
-	// Build instruction data — buy with max token amount, capped by SOL
-	instrData := buildBuyInstructionData(1_000_000_000_000, maxSolCost)
-
-	// Account order for PumpFun buy instruction (must match IDL exactly)
-	accounts := []string{
-		pumpFunGlobal,       // global
-		PumpFunFeeRecipient, // feeRecipient
-		mint,                // mint
-		bondingCurve,        // bondingCurve
-		assocBondingCurve,   // associatedBondingCurve
-		userATA,             // associatedUserAccount
-		walletPubkey,        // user (signer)
-		SystemProgram,       // systemProgram
-		Token2022Program,    // tokenProgram
-		RentSysvar,          // rent
-		PumpFunEventAuth,    // eventAuthority
-		PumpFunProgram,      // program
-	}
-
-	// Build createATA instruction (idempotent — succeeds even if ATA exists)
-	// CreateIdempotent instruction discriminator = 1
-	createATAInstr := Instruction{
-		ProgramID: AssocTokenProgram,
-		Accounts: []string{
-			walletPubkey,    // funding
-			userATA,         // ATA to create
-			walletPubkey,    // wallet owner
-			mint,            // mint
-			SystemProgram,   // system program
-			Token2022Program,// token program
-		},
-		Data: []byte{1}, // CreateIdempotent
-	}
-
-	// Build buy instruction
-	buyInstr := Instruction{
-		ProgramID: PumpFunProgram,
-		Accounts:  accounts,
-		Data:      instrData,
-	}
-
-	txB64, err := e.buildTransaction(blockhash, []Instruction{createATAInstr, buyInstr})
-	if err != nil {
-		return "", fmt.Errorf("buildTransaction: %w", err)
-	}
-
-	// Simulate first
-	if err := e.simulateTransaction(txB64); err != nil {
+	// 3. Simulate first
+	if err := e.simulateTransaction(signedTx); err != nil {
 		return "", fmt.Errorf("simulation failed: %w", err)
 	}
 	log.Println("ExecutionAgent: Simulation passed ✓")
 
-	// Send
-	txHash, err := e.sendTransaction(txB64)
+	// 4. Send
+	txHash, err := e.sendTransaction(signedTx)
 	if err != nil {
 		return "", fmt.Errorf("sendTransaction: %w", err)
 	}
@@ -604,7 +402,7 @@ func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.Candidat
 		return result, fmt.Errorf("unsupported chain: %s", candidate.Token.Chain)
 	}
 
-	// Convert USD → SOL (~$150/SOL estimate)
+	// Convert USD → SOL (~$86/SOL estimate)
 	solAmount := candidate.StrategyDecision.SuggestedAmountUSD / 86.0
 	if solAmount < 0.001 {
 		solAmount = 0.001
@@ -624,24 +422,7 @@ func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.Candidat
 }
 
 func (e *ExecutionAgent) Simulate(ctx context.Context, candidate *models.CandidateToken) (bool, error) {
-	log.Printf("ExecutionAgent: Simulating trade for %s\n", candidate.Token.TokenAddress)
-	if e.privateKey == nil {
-		return true, nil // no key = skip simulation
-	}
-
-	solAmount := candidate.StrategyDecision.SuggestedAmountUSD / 86.0
-	if solAmount < 0.001 {
-		solAmount = 0.001
-	}
-
-	_, err := e.buyOnPumpFun(ctx, candidate.Token.TokenAddress, solAmount)
-	// We only want the simulation result, not actual send — but since
-	// simulation runs before send in buyOnPumpFun, we treat simulation
-	// failure as the signal here
-	if err != nil {
-		log.Printf("ExecutionAgent: Simulate error detail: %v\n", err)
-		return false, err
-	}
+	// Simulation now happens inside buyOnPumpFun — skip duplicate
 	return true, nil
 }
 
