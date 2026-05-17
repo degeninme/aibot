@@ -417,26 +417,47 @@ func (e *ExecutionAgent) sendTransaction(txB64 string) (string, error) {
 // getAssocBondingCurve fetches the associated bonding curve token account
 // by querying the token accounts owned by the bonding curve for the given mint
 func (e *ExecutionAgent) getAssocBondingCurve(bondingCurve, mint string) (string, error) {
-	result, err := e.rpcCall("getTokenAccountsByOwner", []interface{}{
-		bondingCurve,
-		map[string]string{"mint": mint},
-		map[string]string{"encoding": "base64"},
-	})
-	if err != nil {
-		return "", err
+	// Try with Token2022 program first (PumpFun uses Token2022)
+	for _, tokenProg := range []string{Token2022Program, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"} {
+		result, err := e.rpcCall("getTokenAccountsByOwner", []interface{}{
+			bondingCurve,
+			map[string]string{"programId": tokenProg},
+			map[string]string{"encoding": "base64"},
+		})
+		if err != nil {
+			log.Printf("ExecutionAgent: getTokenAccountsByOwner (programId=%s) error: %v\n", tokenProg, err)
+			continue
+		}
+		var out struct {
+			Value []struct {
+				Pubkey  string `json:"pubkey"`
+				Account struct {
+					Data []string `json:"data"`
+				} `json:"account"`
+			} `json:"value"`
+		}
+		if err := json.Unmarshal(result, &out); err != nil {
+			log.Printf("ExecutionAgent: parse token accounts error: %v\n", err)
+			continue
+		}
+		// Find the one matching our mint
+		mintBytes := mustDecode58(mint)
+		for _, acc := range out.Value {
+			if len(acc.Account.Data) < 1 {
+				continue
+			}
+			dataBytes, err := base64.StdEncoding.DecodeString(acc.Account.Data[0])
+			if err != nil || len(dataBytes) < 32 {
+				continue
+			}
+			// First 32 bytes of token account data is the mint
+			if bytes.Equal(dataBytes[0:32], mintBytes) {
+				log.Printf("ExecutionAgent: Found assocBondingCurve via %s: %s\n", tokenProg, acc.Pubkey)
+				return acc.Pubkey, nil
+			}
+		}
 	}
-	var out struct {
-		Value []struct {
-			Pubkey string `json:"pubkey"`
-		} `json:"value"`
-	}
-	if err := json.Unmarshal(result, &out); err != nil {
-		return "", fmt.Errorf("parse token accounts: %w", err)
-	}
-	if len(out.Value) == 0 {
-		return "", fmt.Errorf("no token account found for bondingCurve %s mint %s", bondingCurve, mint)
-	}
-	return out.Value[0].Pubkey, nil
+	return "", fmt.Errorf("no token account found for bondingCurve=%s mint=%s", bondingCurve, mint)
 }
 
 func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmount float64) (string, error) {
@@ -618,6 +639,7 @@ func (e *ExecutionAgent) Simulate(ctx context.Context, candidate *models.Candida
 	// simulation runs before send in buyOnPumpFun, we treat simulation
 	// failure as the signal here
 	if err != nil {
+		log.Printf("ExecutionAgent: Simulate error detail: %v\n", err)
 		return false, err
 	}
 	return true, nil
