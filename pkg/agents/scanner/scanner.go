@@ -83,6 +83,8 @@ type ChainScannerAgent struct {
 	seenSigsMu   sync.Mutex
 	seenMints    map[string]bool
 	seenMintsMu  sync.Mutex
+	// Debug: count how many txs we've fully inspected
+	debugCount int
 }
 
 func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
@@ -260,6 +262,33 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 			continue
 		}
 
+		// ── DEBUG: Print first 3 unseen transactions in full detail ──────────
+		s.seenSigsMu.Lock()
+		debugIdx := s.debugCount
+		if s.debugCount < 3 {
+			s.debugCount++
+		}
+		s.seenSigsMu.Unlock()
+
+		if debugIdx < 3 {
+			log.Printf("=== DEBUG TX [%s] sig=%s ===", source, sig.Signature[:20])
+			log.Printf("  Accounts (%d): %v", len(tx.Transaction.Message.AccountKeys), tx.Transaction.Message.AccountKeys)
+			log.Printf("  PreTokenBalances (%d):", len(tx.Meta.PreTokenBalances))
+			for i, b := range tx.Meta.PreTokenBalances {
+				log.Printf("    [%d] mint=%s owner=%s amount=%v", i, b.Mint, b.Owner, b.UITokenAmount.UIAmount)
+			}
+			log.Printf("  PostTokenBalances (%d):", len(tx.Meta.PostTokenBalances))
+			for i, b := range tx.Meta.PostTokenBalances {
+				log.Printf("    [%d] mint=%s owner=%s amount=%v", i, b.Mint, b.Owner, b.UITokenAmount.UIAmount)
+			}
+			log.Printf("  LogMessages (%d):", len(tx.Meta.LogMessages))
+			for i, m := range tx.Meta.LogMessages {
+				log.Printf("    [%d] %s", i, m)
+			}
+			log.Printf("=== END DEBUG TX ===")
+		}
+		// ── END DEBUG ──────────────────────────────────────────────────────────
+
 		token := s.extractTokenFromTx(tx, sig.Signature, source)
 		if token != nil {
 			s.seenMintsMu.Lock()
@@ -278,28 +307,14 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 	log.Printf("ChainScannerAgent: [%s] %d new txs, %d tokens found\n", source, newCount, tokenCount)
 }
 
-// extractTokenFromTx extracts a new token from a transaction.
-//
-// PumpFun create txs:
-//   - Have empty preTokenBalances
-//   - postTokenBalances[0].mint is the new token mint address
-//   - Log messages contain "Instruction: Create"
-//   - The mint address ends in "pump"
-//
-// PumpSwap create_pool txs:
-//   - postTokenBalances contains the graduated token mint
-//   - Log messages contain "create_pool" or "CreatePool"
 func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source string) *models.TokenFound {
 	accounts := tx.Transaction.Message.AccountKeys
 	if len(accounts) == 0 {
 		return nil
 	}
-
 	logs := tx.Meta.LogMessages
 
-	// ── PumpFun: detect token creation ──────────────────────────────────────
 	if source == "pumpfun" {
-		// Must have a "Create" log - this is the definitive signal
 		isCreate := false
 		for _, msg := range logs {
 			if strings.Contains(msg, "Create") {
@@ -311,25 +326,17 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 			return nil
 		}
 
-		// The mint is at postTokenBalances[0].mint (always index 0 for creates)
 		if len(tx.Meta.PostTokenBalances) == 0 {
-			// Fallback: find account ending in "pump"
 			for _, acc := range accounts {
 				if strings.HasSuffix(acc, "pump") {
-					return s.buildToken(acc, accounts[0], 0, 0, txHash, source, tx.BlockTime, logs)
+					return s.buildToken(acc, accounts[0], 0, 0, txHash, source, tx.BlockTime)
 				}
 			}
 			return nil
 		}
 
 		mint := tx.Meta.PostTokenBalances[0].Mint
-		if mint == "" {
-			return nil
-		}
-
-		// Validate: PumpFun mints always end in "pump"
 		if !strings.HasSuffix(mint, "pump") {
-			// Try finding one that does
 			for _, bal := range tx.Meta.PostTokenBalances {
 				if strings.HasSuffix(bal.Mint, "pump") {
 					mint = bal.Mint
@@ -337,25 +344,20 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 				}
 			}
 		}
-
 		if mint == "" || !strings.HasSuffix(mint, "pump") {
 			return nil
 		}
 
 		reserveToken := tx.Meta.PostTokenBalances[0].UITokenAmount.UIAmount
 		reserveNative := s.estimateSOLReserve(logs)
-		creator := accounts[0] // fee payer is always creator on PumpFun
-
-		return s.buildToken(mint, creator, reserveToken, reserveNative, txHash, source, tx.BlockTime, logs)
+		return s.buildToken(mint, accounts[0], reserveToken, reserveNative, txHash, source, tx.BlockTime)
 	}
 
-	// ── PumpSwap: detect pool creation (graduated tokens) ───────────────────
 	if source == "pumpswap" {
 		isPoolCreate := false
 		for _, msg := range logs {
 			if strings.Contains(msg, "create_pool") ||
 				strings.Contains(msg, "CreatePool") ||
-				strings.Contains(msg, "create pool") ||
 				strings.Contains(msg, "Initialize") {
 				isPoolCreate = true
 				break
@@ -364,8 +366,6 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 		if !isPoolCreate {
 			return nil
 		}
-
-		// Find the non-SOL, non-WSOL mint in postTokenBalances
 		const WSOL = "So11111111111111111111111111111111111111112"
 		for _, bal := range tx.Meta.PostTokenBalances {
 			if bal.Mint != "" && bal.Mint != WSOL {
@@ -374,37 +374,25 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 				if len(accounts) > 0 {
 					creator = accounts[0]
 				}
-				return s.buildToken(bal.Mint, creator, bal.UITokenAmount.UIAmount, reserveNative, txHash, source, tx.BlockTime, logs)
+				return s.buildToken(bal.Mint, creator, bal.UITokenAmount.UIAmount, reserveNative, txHash, source, tx.BlockTime)
 			}
 		}
 	}
-
 	return nil
 }
 
-// buildToken constructs a TokenFound, applying the liquidity filter
-func (s *ChainScannerAgent) buildToken(
-	mint, creator string,
-	reserveToken, reserveNative float64,
-	txHash, source string,
-	blockTime *int64,
-	logs []string,
-) *models.TokenFound {
-	// Apply liquidity filter only when we have a real reserve value
+func (s *ChainScannerAgent) buildToken(mint, creator string, reserveToken, reserveNative float64, txHash, source string, blockTime *int64) *models.TokenFound {
 	if reserveNative > 0 {
 		liquidityUSD := reserveNative * 150.0
 		if liquidityUSD < s.config.MinLiquidity {
-			log.Printf("ChainScannerAgent: Skipping %s - liquidity $%.2f < min $%.2f\n",
-				mint, liquidityUSD, s.config.MinLiquidity)
+			log.Printf("ChainScannerAgent: Skipping %s - liquidity $%.2f < min $%.2f\n", mint, liquidityUSD, s.config.MinLiquidity)
 			return nil
 		}
 	}
-
 	ts := time.Now().Unix()
 	if blockTime != nil {
 		ts = *blockTime
 	}
-
 	return &models.TokenFound{
 		Chain:          models.ChainSolana,
 		TokenAddress:   mint,
