@@ -46,6 +46,7 @@ type signatureInfo struct {
 	Slot      uint64      `json:"slot"`
 	Err       interface{} `json:"err"`
 	BlockTime *int64      `json:"blockTime"`
+	Memo      *string     `json:"memo"`
 }
 
 type txResult struct {
@@ -72,6 +73,23 @@ type tokenBalance struct {
 	} `json:"uiTokenAmount"`
 }
 
+// heliusTx is used for Helius enhanced transaction parsing
+type heliusTx struct {
+	Signature   string `json:"signature"`
+	Type        string `json:"type"`
+	TokenMint   string `json:"tokenMint"`
+	FeePayer    string `json:"feePayer"`
+	Timestamp   int64  `json:"timestamp"`
+	Events      struct {
+		Token *struct {
+			Mint string `json:"mint"`
+		} `json:"token"`
+	} `json:"events"`
+	AccountData []struct {
+		Account string `json:"account"`
+	} `json:"accountData"`
+}
+
 type ChainScannerAgent struct {
 	config       *config.Config
 	tokenChannel chan models.TokenFound
@@ -83,12 +101,23 @@ type ChainScannerAgent struct {
 	seenSigsMu   sync.Mutex
 	seenMints    map[string]bool
 	seenMintsMu  sync.Mutex
-	// Debug: count how many txs we've fully inspected
-	debugCount int
+	heliusAPIKey string
 }
 
 func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
 	ctx, cancel := context.WithCancel(context.Background())
+
+	// Extract Helius API key from RPC URL if present
+	// e.g. https://mainnet.helius-rpc.com/?api-key=XXXXX
+	apiKey := ""
+	rpcURL := cfg.SolanaRPCURL
+	if idx := strings.Index(rpcURL, "api-key="); idx != -1 {
+		apiKey = rpcURL[idx+8:]
+		if end := strings.Index(apiKey, "&"); end != -1 {
+			apiKey = apiKey[:end]
+		}
+	}
+
 	return &ChainScannerAgent{
 		config:       cfg,
 		tokenChannel: make(chan models.TokenFound, 100),
@@ -97,6 +126,7 @@ func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
 		httpClient:   &http.Client{Timeout: 15 * time.Second},
 		seenSigs:     make(map[string]bool),
 		seenMints:    make(map[string]bool),
+		heliusAPIKey: apiKey,
 	}
 }
 
@@ -109,6 +139,9 @@ func (s *ChainScannerAgent) Start() {
 		go s.scanBase()
 	} else {
 		log.Println("ChainScannerAgent: BASE_RPC_URL not set, skipping Base chain scanning")
+	}
+	if s.heliusAPIKey != "" {
+		log.Println("ChainScannerAgent: Helius API key detected - using enhanced transaction API")
 	}
 	log.Println("ChainScannerAgent: Chain monitoring started")
 }
@@ -220,12 +253,144 @@ func (s *ChainScannerAgent) getTransaction(sig string) (*txResult, error) {
 	return &tx, nil
 }
 
-func (s *ChainScannerAgent) scanSolanaNewTokens() {
-	log.Println("ChainScannerAgent: Scanning Solana for new tokens...")
-	s.scanProgram(PumpFunProgram, "pumpfun", 15)
-	s.scanProgram(PumpSwapProgram, "pumpswap", 5)
+// getHeliusEnhancedTxs uses Helius enhanced transactions API to get
+// only CREATE type transactions for PumpFun - much more efficient
+func (s *ChainScannerAgent) getHeliusEnhancedTxs(limit int) ([]heliusTx, error) {
+	url := fmt.Sprintf("https://api.helius.xyz/v0/addresses/%s/transactions?api-key=%s&limit=%d",
+		PumpFunProgram, s.heliusAPIKey, limit)
+
+	httpReq, err := http.NewRequestWithContext(s.ctx, "GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	resp, err := s.httpClient.Do(httpReq)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var txs []heliusTx
+	if err := json.Unmarshal(body, &txs); err != nil {
+		return nil, fmt.Errorf("helius parse error: %w (body: %s)", err, string(body[:min(200, len(body))]))
+	}
+	return txs, nil
 }
 
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
+
+func (s *ChainScannerAgent) scanSolanaNewTokens() {
+	log.Println("ChainScannerAgent: Scanning Solana for new tokens...")
+
+	// Use Helius enhanced API if we have a key — fetch recent txs and filter for create_v2
+	if s.heliusAPIKey != "" {
+		s.scanWithHelius()
+	} else {
+		// Fallback: raw RPC with large limit — creates are rare among buys/sells
+		s.scanProgram(PumpFunProgram, "pumpfun", 200)
+	}
+
+	// PumpSwap: graduated tokens
+	s.scanProgram(PumpSwapProgram, "pumpswap", 10)
+}
+
+// scanWithHelius uses Helius enhanced API to get token creation events
+func (s *ChainScannerAgent) scanWithHelius() {
+	txs, err := s.getHeliusEnhancedTxs(50)
+	if err != nil {
+		log.Printf("ChainScannerAgent: Helius API error: %v, falling back to raw RPC\n", err)
+		s.scanProgram(PumpFunProgram, "pumpfun", 200)
+		return
+	}
+
+	found := 0
+	for _, tx := range txs {
+		// Only process create_v2 instructions
+		isCreate := strings.Contains(strings.ToLower(tx.Type), "create") ||
+			strings.Contains(strings.ToLower(tx.Type), "mint")
+		if !isCreate {
+			continue
+		}
+
+		// Skip seen signatures
+		s.seenSigsMu.Lock()
+		seen := s.seenSigs[tx.Signature]
+		if !seen {
+			s.seenSigs[tx.Signature] = true
+		}
+		s.seenSigsMu.Unlock()
+		if seen {
+			continue
+		}
+
+		// Extract mint — must end in "pump"
+		mint := tx.TokenMint
+		if mint == "" && tx.Events.Token != nil {
+			mint = tx.Events.Token.Mint
+		}
+		// If Helius doesn't give us the mint directly, fall back to full tx fetch
+		if mint == "" || !strings.HasSuffix(mint, "pump") {
+			fullTx, err := s.getTransaction(tx.Signature)
+			if err != nil || fullTx == nil || fullTx.Meta.Err != nil {
+				continue
+			}
+			token := s.extractTokenFromTx(fullTx, tx.Signature, "pumpfun")
+			if token != nil {
+				s.seenMintsMu.Lock()
+				mintSeen := s.seenMints[token.TokenAddress]
+				if !mintSeen {
+					s.seenMints[token.TokenAddress] = true
+				}
+				s.seenMintsMu.Unlock()
+				if !mintSeen {
+					found++
+					log.Printf("ChainScannerAgent: 🚀 New token via Helius+RPC! Mint: %s\n", token.TokenAddress)
+					s.emitTokenFound(*token)
+				}
+			}
+			continue
+		}
+
+		// Deduplicate by mint
+		s.seenMintsMu.Lock()
+		mintSeen := s.seenMints[mint]
+		if !mintSeen {
+			s.seenMints[mint] = true
+		}
+		s.seenMintsMu.Unlock()
+		if mintSeen {
+			continue
+		}
+
+		token := &models.TokenFound{
+			Chain:          models.ChainSolana,
+			TokenAddress:   mint,
+			FirstSeenTS:    tx.Timestamp,
+			CreatorAddress: tx.FeePayer,
+			TxHash:         tx.Signature,
+			InitialLiquidity: models.InitialLiquidity{
+				Pair: "pumpfun",
+			},
+			Metadata: map[string]string{"source": "pumpfun"},
+		}
+
+		found++
+		log.Printf("ChainScannerAgent: 🚀 New token via Helius! Mint: %s creator: %s\n", mint, tx.FeePayer)
+		s.emitTokenFound(*token)
+	}
+	log.Printf("ChainScannerAgent: [helius/pumpfun] %d new tokens found\n", found)
+}
+
+// scanProgram is the raw RPC fallback — fetches many sigs and looks for creates
 func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 	sigs, err := s.getRecentSignatures(programID, limit)
 	if err != nil {
@@ -243,7 +408,7 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 		seen := s.seenSigs[sig.Signature]
 		if !seen {
 			s.seenSigs[sig.Signature] = true
-			if len(s.seenSigs) > 5000 {
+			if len(s.seenSigs) > 10000 {
 				s.pruneSeen()
 			}
 		}
@@ -261,33 +426,6 @@ func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
 		if tx == nil || tx.Meta.Err != nil {
 			continue
 		}
-
-		// ── DEBUG: Print first 3 unseen transactions in full detail ──────────
-		s.seenSigsMu.Lock()
-		debugIdx := s.debugCount
-		if s.debugCount < 3 {
-			s.debugCount++
-		}
-		s.seenSigsMu.Unlock()
-
-		if debugIdx < 3 {
-			log.Printf("=== DEBUG TX [%s] sig=%s ===", source, sig.Signature[:20])
-			log.Printf("  Accounts (%d): %v", len(tx.Transaction.Message.AccountKeys), tx.Transaction.Message.AccountKeys)
-			log.Printf("  PreTokenBalances (%d):", len(tx.Meta.PreTokenBalances))
-			for i, b := range tx.Meta.PreTokenBalances {
-				log.Printf("    [%d] mint=%s owner=%s amount=%v", i, b.Mint, b.Owner, b.UITokenAmount.UIAmount)
-			}
-			log.Printf("  PostTokenBalances (%d):", len(tx.Meta.PostTokenBalances))
-			for i, b := range tx.Meta.PostTokenBalances {
-				log.Printf("    [%d] mint=%s owner=%s amount=%v", i, b.Mint, b.Owner, b.UITokenAmount.UIAmount)
-			}
-			log.Printf("  LogMessages (%d):", len(tx.Meta.LogMessages))
-			for i, m := range tx.Meta.LogMessages {
-				log.Printf("    [%d] %s", i, m)
-			}
-			log.Printf("=== END DEBUG TX ===")
-		}
-		// ── END DEBUG ──────────────────────────────────────────────────────────
 
 		token := s.extractTokenFromTx(tx, sig.Signature, source)
 		if token != nil {
@@ -315,9 +453,12 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 	logs := tx.Meta.LogMessages
 
 	if source == "pumpfun" {
+		// Only process create_v2 instructions — skip Sell/Buy/other
 		isCreate := false
 		for _, msg := range logs {
-			if strings.Contains(msg, "Create") {
+			if strings.Contains(msg, "Instruction: Create") ||
+				strings.Contains(msg, "create_v2") ||
+				strings.Contains(msg, "CreateV2") {
 				isCreate = true
 				break
 			}
@@ -326,29 +467,34 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 			return nil
 		}
 
-		if len(tx.Meta.PostTokenBalances) == 0 {
+		// Find mint ending in "pump" in post token balances
+		mint := ""
+		for _, bal := range tx.Meta.PostTokenBalances {
+			if strings.HasSuffix(bal.Mint, "pump") {
+				mint = bal.Mint
+				break
+			}
+		}
+		// Fallback: scan account keys
+		if mint == "" {
 			for _, acc := range accounts {
 				if strings.HasSuffix(acc, "pump") {
-					return s.buildToken(acc, accounts[0], 0, 0, txHash, source, tx.BlockTime)
-				}
-			}
-			return nil
-		}
-
-		mint := tx.Meta.PostTokenBalances[0].Mint
-		if !strings.HasSuffix(mint, "pump") {
-			for _, bal := range tx.Meta.PostTokenBalances {
-				if strings.HasSuffix(bal.Mint, "pump") {
-					mint = bal.Mint
+					mint = acc
 					break
 				}
 			}
 		}
-		if mint == "" || !strings.HasSuffix(mint, "pump") {
+		if mint == "" {
 			return nil
 		}
 
-		reserveToken := tx.Meta.PostTokenBalances[0].UITokenAmount.UIAmount
+		var reserveToken float64
+		for _, bal := range tx.Meta.PostTokenBalances {
+			if bal.Mint == mint {
+				reserveToken = bal.UITokenAmount.UIAmount
+				break
+			}
+		}
 		reserveNative := s.estimateSOLReserve(logs)
 		return s.buildToken(mint, accounts[0], reserveToken, reserveNative, txHash, source, tx.BlockTime)
 	}
@@ -429,7 +575,7 @@ func (s *ChainScannerAgent) pruneSeen() {
 	for k := range s.seenSigs {
 		delete(s.seenSigs, k)
 		count++
-		if count >= 2500 {
+		if count >= 5000 {
 			break
 		}
 	}
