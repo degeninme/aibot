@@ -23,7 +23,7 @@ import (
 const (
 	PumpFunProgram      = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 	PumpFunFeeRecipient = "CebN5WGQ4jvEPvsVU4EoHEpgznyQHeAoceR5oHAjXHN"
-	PumpFunGlobal       = "4wTV1YmiEkRvAtNtsSGPtUrqRYQMe5zP9QkdxEJA7Gy"
+	PumpFunGlobal       = "" // derived at runtime via deriveGlobalPDA()
 	PumpFunEventAuth    = "Ce6TQqeHC9p8KetsN6JsjHK7UTZk7nasjjnr7XxXp9F"
 	SystemProgram       = "11111111111111111111111111111111"
 	Token2022Program    = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
@@ -138,6 +138,15 @@ func createProgramAddress(seeds [][]byte, programID []byte) ([]byte, error) {
 	// Simple check: if it decodes as a valid curve point, reject
 	// For our purposes we just return it — the nonce loop handles off-curve
 	return hash, nil
+}
+
+
+// deriveGlobalPDA derives the PumpFun global state PDA from seed "global"
+func deriveGlobalPDA() ([]byte, error) {
+	programID := mustDecode58(PumpFunProgram)
+	seeds := [][]byte{[]byte("global")}
+	addr, _, err := findProgramAddress(seeds, programID)
+	return addr, err
 }
 
 // deriveBondingCurvePDA derives the bonding curve PDA for a mint
@@ -403,6 +412,14 @@ func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmoun
 
 	log.Printf("ExecutionAgent: Buying mint=%s sol=%.4f lamports=%d\n", mint, solAmount, lamports)
 
+	// Derive global PDA
+	globalBytes, err := deriveGlobalPDA()
+	if err != nil {
+		return "", fmt.Errorf("deriveGlobalPDA: %w", err)
+	}
+	pumpFunGlobal := base58Encode(globalBytes)
+	log.Printf("ExecutionAgent: global=%s\n", pumpFunGlobal)
+
 	// Derive accounts
 	mintBytes := mustDecode58(mint)
 	tokenProgBytes := mustDecode58(Token2022Program)
@@ -444,7 +461,7 @@ func (e *ExecutionAgent) buyOnPumpFun(ctx context.Context, mint string, solAmoun
 
 	// Account order for PumpFun buy instruction (must match IDL exactly)
 	accounts := []string{
-		PumpFunGlobal,       // global
+		pumpFunGlobal,       // global
 		PumpFunFeeRecipient, // feeRecipient
 		mint,                // mint
 		bondingCurve,        // bondingCurve
@@ -507,7 +524,7 @@ func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.Candidat
 	}
 
 	// Convert USD → SOL (~$150/SOL estimate)
-	solAmount := candidate.StrategyDecision.SuggestedAmountUSD / 150.0
+	solAmount := candidate.StrategyDecision.SuggestedAmountUSD / 86.0
 	if solAmount < 0.001 {
 		solAmount = 0.001
 	}
@@ -531,7 +548,7 @@ func (e *ExecutionAgent) Simulate(ctx context.Context, candidate *models.Candida
 		return true, nil // no key = skip simulation
 	}
 
-	solAmount := candidate.StrategyDecision.SuggestedAmountUSD / 150.0
+	solAmount := candidate.StrategyDecision.SuggestedAmountUSD / 86.0
 	if solAmount < 0.001 {
 		solAmount = 0.001
 	}
