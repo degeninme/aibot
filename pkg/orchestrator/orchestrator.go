@@ -260,3 +260,8 @@ func (o *Orchestrator) GetListing() *listing.CandidateListingAgent {
 func (o *Orchestrator) GetRisk() *risk.RiskManagerAgent {
 	return o.risk
 }
+
+// GetExecution returns the execution agent
+func (o *Orchestrator) GetExecution() *execution.ExecutionAgent {
+	return o.execution
+}
