@@ -49,6 +49,17 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		return exec.GetWalletBalanceUSD()
 	})
 
+	// Start a goroutine that keeps risk exposure in sync with actual open positions
+	// This handles cases where the user manually sold tokens
+	go func() {
+		ticker := time.NewTicker(30 * time.Second)
+		defer ticker.Stop()
+		for range ticker.C {
+			actualExposure := exec.GetCurrentExposureUSD()
+			riskMgr.SyncExposure(actualExposure)
+		}
+	}()
+
 	return &Orchestrator{
 		config:    cfg,
 		scanner:   scanner.NewChainScannerAgent(cfg),
