@@ -160,6 +160,10 @@ type ExecutionAgent struct {
 	cachedBalanceSOL float64
 	balanceMu        sync.RWMutex
 	lastBalanceCheck time.Time
+
+	// Cooldown between buys (prevents rapid-fire on multiple new tokens)
+	lastBuyAt time.Time
+	buyMu     sync.Mutex
 }
 
 // NewExecutionAgent creates a new execution agent
@@ -240,11 +244,11 @@ func (e *ExecutionAgent) fetchWalletBalanceSOL() (float64, error) {
 	return float64(out.Value) / 1_000_000_000, nil
 }
 
-// GetWalletBalanceSOL returns the cached balance, refreshing if stale (>15s)
+// GetWalletBalanceSOL returns the cached balance, refreshing if stale (>60s)
 func (e *ExecutionAgent) GetWalletBalanceSOL() float64 {
 	e.balanceMu.RLock()
 	bal := e.cachedBalanceSOL
-	stale := time.Since(e.lastBalanceCheck) > 15*time.Second
+	stale := time.Since(e.lastBalanceCheck) > 60*time.Second
 	e.balanceMu.RUnlock()
 
 	if stale && e.privateKey != nil {
@@ -467,17 +471,25 @@ func (e *ExecutionAgent) sellOnPumpFun(ctx context.Context, mint string, percent
 		return "", fmt.Errorf("no private key configured")
 	}
 
-	// Check actual token balance first — if zero, position is phantom
-	bal, _, err := e.fetchTokenBalance(mint)
-	if err != nil {
-		log.Printf("ExecutionAgent: Could not check token balance: %v\n", err)
-	} else if bal == 0 {
-		log.Printf("ExecutionAgent: Token balance is 0 for %s — dropping phantom position\n", mint)
-		e.recordOutcome(mint, "phantom")
-		return "", fmt.Errorf("zero balance — position dropped")
+	// Grace period: don't run phantom checks within 60s of opening a position
+	// RPCs need time to see new token accounts after a buy
+	e.positionsMu.RLock()
+	pos, hasPos := e.positions[mint]
+	e.positionsMu.RUnlock()
+	if hasPos && time.Since(pos.OpenedAt) < 60*time.Second {
+		log.Printf("ExecutionAgent: Skipping balance check for %s (within 60s grace period)\n", mint[:10])
+	} else {
+		// Check actual token balance first — if zero, position is phantom
+		bal, _, err := e.fetchTokenBalance(mint)
+		if err != nil {
+			log.Printf("ExecutionAgent: Could not check token balance: %v\n", err)
+		} else if bal == 0 {
+			log.Printf("ExecutionAgent: Token balance is 0 for %s — dropping phantom position\n", mint)
+			e.recordOutcome(mint, "phantom")
+			return "", fmt.Errorf("zero balance — position dropped")
+		}
+		log.Printf("ExecutionAgent: Selling %d%% of mint=%s (holding %d tokens)\n", percentage, mint, bal)
 	}
-
-	log.Printf("ExecutionAgent: Selling %d%% of mint=%s (holding %d tokens)\n", percentage, mint, bal)
 
 	txB64, err := e.getSwapTransactionSell(mint, percentage)
 	if err != nil {
@@ -989,6 +1001,30 @@ func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.Candidat
 		solAmount = 0.001
 	}
 
+	// Buy cooldown: prevent rapid-fire trades on multiple new tokens
+	// Default 30s between buys, override via BUY_COOLDOWN_SEC env var
+	cooldownSec := 30
+	if v := os.Getenv("BUY_COOLDOWN_SEC"); v != "" {
+		var n int
+		fmt.Sscanf(v, "%d", &n)
+		if n > 0 {
+			cooldownSec = n
+		}
+	}
+	e.buyMu.Lock()
+	timeSince := time.Since(e.lastBuyAt)
+	if timeSince < time.Duration(cooldownSec)*time.Second {
+		e.buyMu.Unlock()
+		waitNeeded := time.Duration(cooldownSec)*time.Second - timeSince
+		log.Printf("ExecutionAgent: Cooldown active — last buy was %v ago, need to wait %v more\n",
+			timeSince.Truncate(time.Second), waitNeeded.Truncate(time.Second))
+		result.Status = "failed"
+		result.Error = "buy_cooldown_active"
+		return result, fmt.Errorf("buy cooldown active")
+	}
+	e.lastBuyAt = time.Now()
+	e.buyMu.Unlock()
+
 	txHash, err := e.buyOnPumpFun(ctx, candidate.Token.TokenAddress, solAmount)
 	if err != nil {
 		log.Printf("ExecutionAgent: Buy failed: %v\n", err)
@@ -1002,14 +1038,14 @@ func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.Candidat
 
 	// Wait briefly for tx to settle, then verify we actually got tokens
 	go func() {
-		time.Sleep(15 * time.Second)
+		time.Sleep(60 * time.Second)
 		bal, _, err := e.fetchTokenBalance(candidate.Token.TokenAddress)
 		if err != nil {
 			log.Printf("ExecutionAgent: Post-buy balance check failed: %v\n", err)
 			return
 		}
 		if bal == 0 {
-			log.Printf("ExecutionAgent: ⚠️  Buy completed but 0 tokens received — dropping %s (likely failed on-chain)\n", candidate.Token.TokenAddress)
+			log.Printf("ExecutionAgent: ⚠️  60s after buy, still 0 tokens — dropping %s (likely failed on-chain)\n", candidate.Token.TokenAddress)
 			e.recordOutcome(candidate.Token.TokenAddress, "phantom")
 		} else {
 			log.Printf("ExecutionAgent: ✓ Verified %d tokens received for %s\n", bal, candidate.Token.TokenAddress[:10])
