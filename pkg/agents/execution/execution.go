@@ -846,10 +846,48 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		e.positionsMu.Unlock()
 		return
 	}
+	tp1Done := pos.TP1Done
+	tp2Done := pos.TP2Done
+	openedAt := pos.OpenedAt
 	e.positionsMu.Unlock()
 
+	age := time.Since(openedAt)
+
+	// ── PRICE-INDEPENDENT TIMEOUT (works even when bonding curve read fails) ──
+	// If we can't read price, still enforce timeout to avoid stuck positions
+	maxHoldMin := 5
+	if v := os.Getenv("MAX_HOLD_MINUTES"); v != "" {
+		var n int
+		fmt.Sscanf(v, "%d", &n)
+		if n > 0 {
+			maxHoldMin = n
+		}
+	}
+	if !tp1Done && age > time.Duration(maxHoldMin)*time.Minute {
+		log.Printf("ExecutionAgent: TIMEOUT (%v old, no TP1, force selling) — %s\n",
+			age.Truncate(time.Second), mint)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		txHash, err := e.sellOnPumpFun(ctx, mint, 100)
+		if err != nil {
+			log.Printf("ExecutionAgent: Timeout sell failed: %v\n", err)
+		} else {
+			estSol := pos.SolSpent // assume break-even if no price data
+			e.recordSellTx(mint, txHash, estSol)
+			e.recordOutcome(mint, "timeout")
+			log.Printf("ExecutionAgent: ✅ Position closed via timeout: %s\n", txHash)
+		}
+		return
+	}
+
+	// Get price for TP/SL checks
 	mult := e.getCurrentMultiplier(pos)
 	if mult <= 0 {
+		// Log every ~30s so we know monitor is alive but price is unreadable
+		if int(age.Seconds())%30 < 5 {
+			log.Printf("ExecutionAgent: Position %s — age=%v (price unreadable, waiting for timeout)\n",
+				mint[:10], age.Truncate(time.Second))
+		}
 		return
 	}
 
@@ -858,10 +896,7 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 	if mult > pos.PeakMultiplier {
 		pos.PeakMultiplier = mult
 	}
-	tp1Done := pos.TP1Done
-	tp2Done := pos.TP2Done
 	peakMult := pos.PeakMultiplier
-	age := time.Since(pos.OpenedAt)
 	e.positionsMu.Unlock()
 
 	log.Printf("ExecutionAgent: Position %s — multiplier=%.2fx peak=%.2fx age=%v\n",
@@ -944,23 +979,7 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		return
 	}
 
-	// ── Timeout: 5 minutes pre-TP1 ────────────────────────────
-	if !tp1Done && age > 5*time.Minute {
-		log.Printf("ExecutionAgent: TIMEOUT (%.0fs old, no TP1) — selling 100%% of %s\n",
-			age.Seconds(), mint)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, 100)
-		if err != nil {
-			log.Printf("ExecutionAgent: Timeout sell failed: %v\n", err)
-		} else {
-			estSol := e.estimateCurrentSolValue(mint, pos.SolSpent, mult)
-			e.recordSellTx(mint, txHash, estSol)
-			e.recordOutcome(mint, "timeout")
-			log.Printf("ExecutionAgent: ✅ Position closed via timeout: %s\n", txHash)
-		}
-		return
-	}
+	// (Timeout is now handled at the top of checkPosition, price-independent)
 }
 
 // estimateCurrentSolValue estimates how much SOL the remaining position is worth
