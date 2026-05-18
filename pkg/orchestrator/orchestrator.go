@@ -40,7 +40,15 @@ type Orchestrator struct {
 // NewOrchestrator creates a new orchestrator
 func NewOrchestrator(cfg *config.Config) *Orchestrator {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
+	exec := execution.NewExecutionAgent(cfg)
+	riskMgr := risk.NewRiskManagerAgent(cfg)
+
+	// Wire up live wallet balance to risk manager
+	riskMgr.SetBalanceProvider(func() float64 {
+		return exec.GetWalletBalanceUSD()
+	})
+
 	return &Orchestrator{
 		config:    cfg,
 		scanner:   scanner.NewChainScannerAgent(cfg),
@@ -49,8 +57,8 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		offchain:  offchain.NewOffChainDataAgent(cfg),
 		strategy:  strategy.NewStrategyEvaluatorAgent(cfg),
 		listing:   listing.NewCandidateListingAgent(),
-		execution: execution.NewExecutionAgent(cfg),
-		risk:      risk.NewRiskManagerAgent(cfg),
+		execution: exec,
+		risk:      riskMgr,
 		telemetry: telemetry.NewTelemetryAgent(),
 		ctx:       ctx,
 		cancel:    cancel,
