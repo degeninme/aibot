@@ -290,7 +290,7 @@ func (s *ChainScannerAgent) scanSolanaNewTokens() {
 		s.scanWithHelius()
 	} else {
 		// Fallback: raw RPC with large limit
-		s.scanProgram(PumpFunProgram, "pumpfun", 200)
+		s.scanProgram(PumpFunProgram, "pumpfun", 50)
 	}
 
 	// PumpSwap scanning disabled — mostly buy/sell noise, not new token creates
@@ -302,7 +302,7 @@ func (s *ChainScannerAgent) scanWithHelius() {
 	txs, err := s.getHeliusEnhancedTxs(50)
 	if err != nil {
 		log.Printf("ChainScannerAgent: Helius API error: %v, falling back to raw RPC\n", err)
-		s.scanProgram(PumpFunProgram, "pumpfun", 200)
+		s.scanProgram(PumpFunProgram, "pumpfun", 50)
 		return
 	}
 
@@ -381,9 +381,12 @@ func (s *ChainScannerAgent) scanWithHelius() {
 		}
 
 		// Dev wallet check — reject if dev sold or holds too much
-		devResult := s.checkDevWallet(mint, tx.FeePayer)
-		if devResult.skip {
-			continue
+		// (Only run if DEV_CHECK is not disabled — saves RPC calls)
+		if os.Getenv("DEV_CHECK") != "false" {
+			devResult := s.checkDevWallet(mint, tx.FeePayer)
+			if devResult.skip {
+				continue
+			}
 		}
 
 		token := &models.TokenFound{
