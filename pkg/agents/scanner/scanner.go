@@ -339,6 +339,11 @@ func (s *ChainScannerAgent) scanWithHelius() {
 			}
 			token := s.extractTokenFromTx(fullTx, tx.Signature, "pumpfun")
 			if token != nil {
+				// Dev check before emitting
+				devResult := s.checkDevWallet(token.TokenAddress, token.CreatorAddress)
+				if devResult.skip {
+					continue
+				}
 				s.seenMintsMu.Lock()
 				mintSeen := s.seenMints[token.TokenAddress]
 				if !mintSeen {
@@ -347,7 +352,8 @@ func (s *ChainScannerAgent) scanWithHelius() {
 				s.seenMintsMu.Unlock()
 				if !mintSeen {
 					found++
-					log.Printf("ChainScannerAgent: 🚀 New token via Helius+RPC! Mint: %s\n", token.TokenAddress)
+					log.Printf("ChainScannerAgent: 🚀 New token via Helius+RPC! Mint: %s (dev %.2f%%)\n",
+						token.TokenAddress, devResult.devPct)
 					s.emitTokenFound(*token)
 				}
 			}
@@ -374,6 +380,12 @@ func (s *ChainScannerAgent) scanWithHelius() {
 			}
 		}
 
+		// Dev wallet check — reject if dev sold or holds too much
+		devResult := s.checkDevWallet(mint, tx.FeePayer)
+		if devResult.skip {
+			continue
+		}
+
 		token := &models.TokenFound{
 			Chain:          models.ChainSolana,
 			TokenAddress:   mint,
@@ -383,7 +395,10 @@ func (s *ChainScannerAgent) scanWithHelius() {
 			InitialLiquidity: models.InitialLiquidity{
 				Pair: "pumpfun",
 			},
-			Metadata: map[string]string{"source": "pumpfun"},
+			Metadata: map[string]string{
+				"source":  "pumpfun",
+				"dev_pct": fmt.Sprintf("%.2f", devResult.devPct),
+			},
 		}
 
 		found++
@@ -581,6 +596,150 @@ func (s *ChainScannerAgent) pruneSeen() {
 
 func (s *ChainScannerAgent) scanBaseNewTokens() {
 	log.Println("ChainScannerAgent: Scanning Base for new tokens...")
+}
+
+// devCheckResult holds results of the dev wallet inspection
+type devCheckResult struct {
+	skip       bool
+	reason     string
+	devBalance uint64
+	supply     uint64
+	devPct     float64
+}
+
+// checkDevWallet examines creator/dev holdings & detects dev sells
+// Returns devCheckResult.skip=true if we should NOT buy this token
+func (s *ChainScannerAgent) checkDevWallet(mint, creator string) devCheckResult {
+	if creator == "" {
+		return devCheckResult{}
+	}
+
+	// Get dev's token account for this mint
+	devBalance, decimals, err := s.fetchTokenBalance(creator, mint)
+	if err != nil {
+		log.Printf("ChainScannerAgent: dev check - couldn't fetch %s balance for %s: %v\n",
+			creator[:10], mint[:10], err)
+		return devCheckResult{} // fail open on RPC errors
+	}
+
+	// Get total supply from mint account
+	supply, err := s.fetchMintSupply(mint)
+	if err != nil || supply == 0 {
+		// Default to PumpFun's standard 1B supply with 6 decimals
+		supply = 1_000_000_000 * 1_000_000
+	}
+
+	pct := 0.0
+	if supply > 0 {
+		pct = float64(devBalance) / float64(supply) * 100.0
+	}
+
+	// Detect dev sell: bonding curve has activity (mint has trades) but dev holds 0
+	// We approximate this — if dev=0 right at creation, that means they sold the creator
+	// allocation already in the same or immediately following transaction.
+	if devBalance == 0 {
+		log.Printf("ChainScannerAgent: 🚫 Dev SOLD %s — dev wallet %s holds 0 tokens (decimals=%d, supply=%d)\n",
+			mint[:10], creator[:10], decimals, supply)
+		return devCheckResult{
+			skip:       true,
+			reason:     "dev_already_sold",
+			devBalance: devBalance,
+			supply:     supply,
+			devPct:     pct,
+		}
+	}
+
+	// Reject if dev holds > 5% (configurable via DEV_MAX_PCT env var, default 5%)
+	maxDevPct := 5.0
+	if envVal := os.Getenv("DEV_MAX_PCT"); envVal != "" {
+		var v float64
+		fmt.Sscanf(envVal, "%f", &v)
+		if v > 0 {
+			maxDevPct = v
+		}
+	}
+	if pct > maxDevPct {
+		log.Printf("ChainScannerAgent: 🚫 Dev holds too much (%.2f%% > %.2f%%) — skipping %s\n",
+			pct, maxDevPct, mint[:10])
+		return devCheckResult{
+			skip:       true,
+			reason:     "dev_holds_too_much",
+			devBalance: devBalance,
+			supply:     supply,
+			devPct:     pct,
+		}
+	}
+
+	log.Printf("ChainScannerAgent: ✓ Dev check passed for %s — dev holds %.2f%% (%d tokens)\n",
+		mint[:10], pct, devBalance)
+	return devCheckResult{
+		skip:       false,
+		devBalance: devBalance,
+		supply:     supply,
+		devPct:     pct,
+	}
+}
+
+// fetchTokenBalance returns the balance the given owner has of a specific mint
+func (s *ChainScannerAgent) fetchTokenBalance(owner, mint string) (uint64, uint8, error) {
+	resp, err := s.rpcCall("getTokenAccountsByOwner", []interface{}{
+		owner,
+		map[string]string{"mint": mint},
+		map[string]string{"encoding": "jsonParsed"},
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	var out struct {
+		Value []struct {
+			Account struct {
+				Data struct {
+					Parsed struct {
+						Info struct {
+							TokenAmount struct {
+								Amount   string `json:"amount"`
+								Decimals uint8  `json:"decimals"`
+							} `json:"tokenAmount"`
+						} `json:"info"`
+					} `json:"parsed"`
+				} `json:"data"`
+			} `json:"account"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return 0, 0, err
+	}
+	if len(out.Value) == 0 {
+		return 0, 6, nil // PumpFun uses 6 decimals
+	}
+	amtStr := out.Value[0].Account.Data.Parsed.Info.TokenAmount.Amount
+	decimals := out.Value[0].Account.Data.Parsed.Info.TokenAmount.Decimals
+	var amt uint64
+	fmt.Sscanf(amtStr, "%d", &amt)
+	return amt, decimals, nil
+}
+
+// fetchMintSupply returns the total supply of a mint
+func (s *ChainScannerAgent) fetchMintSupply(mint string) (uint64, error) {
+	resp, err := s.rpcCall("getTokenSupply", []interface{}{
+		mint,
+		map[string]string{"commitment": "confirmed"},
+	})
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		Value struct {
+			Amount   string `json:"amount"`
+			Decimals uint8  `json:"decimals"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return 0, err
+	}
+	var supply uint64
+	fmt.Sscanf(out.Value.Amount, "%d", &supply)
+	return supply, nil
 }
 
 func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
