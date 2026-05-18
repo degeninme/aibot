@@ -240,11 +240,11 @@ func (e *ExecutionAgent) fetchWalletBalanceSOL() (float64, error) {
 	return float64(out.Value) / 1_000_000_000, nil
 }
 
-// GetWalletBalanceSOL returns the cached balance, refreshing if stale (>30s)
+// GetWalletBalanceSOL returns the cached balance, refreshing if stale (>15s)
 func (e *ExecutionAgent) GetWalletBalanceSOL() float64 {
 	e.balanceMu.RLock()
 	bal := e.cachedBalanceSOL
-	stale := time.Since(e.lastBalanceCheck) > 30*time.Second
+	stale := time.Since(e.lastBalanceCheck) > 15*time.Second
 	e.balanceMu.RUnlock()
 
 	if stale && e.privateKey != nil {
