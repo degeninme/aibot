@@ -98,11 +98,28 @@ type Position struct {
 	TokensHeld     uint64    `json:"tokens_held"`    // raw token amount (with decimals)
 	OriginalTokens uint64    `json:"original_tokens"`
 	SolSpent       float64   `json:"sol_spent"`
+	SolRecovered   float64   `json:"sol_recovered"` // cumulative SOL from sells
 	OpenedAt       time.Time `json:"opened_at"`
 	TP1Done        bool      `json:"tp1_done"`
 	TP2Done        bool      `json:"tp2_done"`
 	PeakMultiplier float64   `json:"peak_multiplier"` // for trailing stop
 	BuyTxHash      string    `json:"buy_tx_hash"`
+}
+
+// TradeOutcome records a closed position for analysis
+type TradeOutcome struct {
+	Mint           string        `json:"mint"`
+	OpenedAt       time.Time     `json:"opened_at"`
+	ClosedAt       time.Time     `json:"closed_at"`
+	Duration       time.Duration `json:"duration"`
+	SolIn          float64       `json:"sol_in"`
+	SolOut         float64       `json:"sol_out"`
+	PnLSol         float64       `json:"pnl_sol"`
+	PnLPct         float64       `json:"pnl_pct"`
+	PeakMultiplier float64       `json:"peak_multiplier"`
+	ExitReason     string        `json:"exit_reason"` // tp1, tp2, trailing_stop, stop_loss, timeout, phantom
+	BuyTxHash      string        `json:"buy_tx_hash"`
+	SellTxHashes   []string      `json:"sell_tx_hashes"`
 }
 
 // ─── Solana RPC types ─────────────────────────────────────────────────────────
@@ -133,6 +150,12 @@ type ExecutionAgent struct {
 	positions   map[string]*Position
 	positionsMu sync.RWMutex
 
+	// Closed trade history (for outcome analysis)
+	closedTrades   []TradeOutcome
+	closedTradesMu sync.RWMutex
+	// Track sell tx hashes per position before close
+	sellTxHashes map[string][]string
+
 	// Cached wallet balance (updates periodically)
 	cachedBalanceSOL float64
 	balanceMu        sync.RWMutex
@@ -142,9 +165,10 @@ type ExecutionAgent struct {
 // NewExecutionAgent creates a new execution agent
 func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
 	agent := &ExecutionAgent{
-		config:     cfg,
-		httpClient: &http.Client{Timeout: 30 * time.Second},
-		positions:  make(map[string]*Position),
+		config:       cfg,
+		httpClient:   &http.Client{Timeout: 30 * time.Second},
+		positions:    make(map[string]*Position),
+		sellTxHashes: make(map[string][]string),
 	}
 
 	log.Println("ExecutionAgent: Using PumpPortal trade-local API (free, no key required)")
@@ -449,9 +473,7 @@ func (e *ExecutionAgent) sellOnPumpFun(ctx context.Context, mint string, percent
 		log.Printf("ExecutionAgent: Could not check token balance: %v\n", err)
 	} else if bal == 0 {
 		log.Printf("ExecutionAgent: Token balance is 0 for %s — dropping phantom position\n", mint)
-		e.positionsMu.Lock()
-		delete(e.positions, mint)
-		e.positionsMu.Unlock()
+		e.recordOutcome(mint, "phantom")
 		return "", fmt.Errorf("zero balance — position dropped")
 	}
 
@@ -466,14 +488,11 @@ func (e *ExecutionAgent) sellOnPumpFun(ctx context.Context, mint string, percent
 		return "", fmt.Errorf("signTransaction: %w", err)
 	}
 	if err := e.simulateTransaction(signedTx); err != nil {
-		// Detect SellZeroAmount (6022) - means we don't actually hold the token
 		errStr := err.Error()
 		if bytes.Contains([]byte(errStr), []byte("6022")) ||
 			bytes.Contains([]byte(errStr), []byte("SellZeroAmount")) {
 			log.Printf("ExecutionAgent: SellZeroAmount detected — dropping phantom position %s\n", mint)
-			e.positionsMu.Lock()
-			delete(e.positions, mint)
-			e.positionsMu.Unlock()
+			e.recordOutcome(mint, "phantom")
 		}
 		return "", fmt.Errorf("sell simulation failed: %w", err)
 	}
@@ -632,6 +651,145 @@ func shaPDA(seeds [][]byte, program []byte) []byte {
 	return h.Sum(nil)
 }
 
+// recordOutcome closes a position with an outcome record and logs it for analysis
+func (e *ExecutionAgent) recordOutcome(mint string, reason string) {
+	e.positionsMu.Lock()
+	pos, ok := e.positions[mint]
+	if !ok {
+		e.positionsMu.Unlock()
+		return
+	}
+	delete(e.positions, mint)
+	e.positionsMu.Unlock()
+
+	sellHashes := []string{}
+	if hashes, ok := e.sellTxHashes[mint]; ok {
+		sellHashes = hashes
+		delete(e.sellTxHashes, mint)
+	}
+
+	now := time.Now()
+	pnlSol := pos.SolRecovered - pos.SolSpent
+	pnlPct := 0.0
+	if pos.SolSpent > 0 {
+		pnlPct = (pnlSol / pos.SolSpent) * 100
+	}
+
+	outcome := TradeOutcome{
+		Mint:           mint,
+		OpenedAt:       pos.OpenedAt,
+		ClosedAt:       now,
+		Duration:       now.Sub(pos.OpenedAt),
+		SolIn:          pos.SolSpent,
+		SolOut:         pos.SolRecovered,
+		PnLSol:         pnlSol,
+		PnLPct:         pnlPct,
+		PeakMultiplier: pos.PeakMultiplier,
+		ExitReason:     reason,
+		BuyTxHash:      pos.BuyTxHash,
+		SellTxHashes:   sellHashes,
+	}
+
+	e.closedTradesMu.Lock()
+	e.closedTrades = append(e.closedTrades, outcome)
+	e.closedTradesMu.Unlock()
+
+	// Log in a single-line JSON format that's easy to grep/parse from Railway logs
+	jsonStr, _ := json.Marshal(outcome)
+	log.Printf("TRADE_OUTCOME %s\n", string(jsonStr))
+
+	// Also log a human-readable summary
+	emoji := "🔴"
+	if pnlSol > 0 {
+		emoji = "🟢"
+	} else if pnlSol == 0 {
+		emoji = "⚪"
+	}
+	log.Printf("%s Closed %s: PnL=%.4f SOL (%.1f%%) peak=%.2fx duration=%v reason=%s\n",
+		emoji, mint[:10], pnlSol, pnlPct, pos.PeakMultiplier, outcome.Duration.Truncate(time.Second), reason)
+
+	// Log running aggregate stats every close
+	e.logAggregateStats()
+}
+
+// recordSellTx remembers a sell tx hash for the outcome record
+func (e *ExecutionAgent) recordSellTx(mint, txHash string, solReceived float64) {
+	e.positionsMu.Lock()
+	if pos, ok := e.positions[mint]; ok {
+		pos.SolRecovered += solReceived
+	}
+	e.positionsMu.Unlock()
+
+	e.sellTxHashes[mint] = append(e.sellTxHashes[mint], txHash)
+}
+
+// logAggregateStats prints a one-line summary of all closed trades so far
+func (e *ExecutionAgent) logAggregateStats() {
+	e.closedTradesMu.RLock()
+	defer e.closedTradesMu.RUnlock()
+
+	if len(e.closedTrades) == 0 {
+		return
+	}
+
+	totalIn, totalOut := 0.0, 0.0
+	wins, losses, breakeven := 0, 0, 0
+	timeouts, stoplosses, tp1s, tp2s, trailing, phantoms := 0, 0, 0, 0, 0, 0
+	maxWin, maxLoss := 0.0, 0.0
+	totalPeakMult := 0.0
+
+	for _, t := range e.closedTrades {
+		totalIn += t.SolIn
+		totalOut += t.SolOut
+		totalPeakMult += t.PeakMultiplier
+		if t.PnLSol > 0 {
+			wins++
+			if t.PnLSol > maxWin {
+				maxWin = t.PnLSol
+			}
+		} else if t.PnLSol < 0 {
+			losses++
+			if t.PnLSol < maxLoss {
+				maxLoss = t.PnLSol
+			}
+		} else {
+			breakeven++
+		}
+		switch t.ExitReason {
+		case "timeout":
+			timeouts++
+		case "stop_loss":
+			stoplosses++
+		case "tp1":
+			tp1s++
+		case "tp2":
+			tp2s++
+		case "trailing_stop":
+			trailing++
+		case "phantom":
+			phantoms++
+		}
+	}
+
+	n := len(e.closedTrades)
+	winRate := float64(wins) / float64(n) * 100
+	avgPeak := totalPeakMult / float64(n)
+
+	log.Printf("=== TRADE STATS (n=%d) === Win%%=%.0f%% NetPnL=%.4f SOL MaxWin=%.4f MaxLoss=%.4f AvgPeak=%.2fx\n",
+		n, winRate, totalOut-totalIn, maxWin, maxLoss, avgPeak)
+	log.Printf("=== EXITS === TP1=%d TP2=%d TrailStop=%d StopLoss=%d Timeout=%d Phantom=%d\n",
+		tp1s, tp2s, trailing, stoplosses, timeouts, phantoms)
+}
+
+// GetClosedTrades returns all closed trade outcomes (for an HTTP endpoint maybe)
+func (e *ExecutionAgent) GetClosedTrades() []TradeOutcome {
+	e.closedTradesMu.RLock()
+	defer e.closedTradesMu.RUnlock()
+	result := make([]TradeOutcome, len(e.closedTrades))
+	copy(result, e.closedTrades)
+	return result
+}
+
 // monitorPositionsLoop runs periodically to check positions for TP/SL/timeout
 func (e *ExecutionAgent) monitorPositionsLoop() {
 	if e.privateKey == nil {
@@ -694,10 +852,13 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		if err != nil {
 			log.Printf("ExecutionAgent: TP1 sell failed: %v\n", err)
 		} else {
+			// Recovered ~50% of position at 2x = ~1.0x of original stake
+			estSol := pos.SolSpent * mult * 0.5
+			e.recordSellTx(mint, txHash, estSol)
 			e.positionsMu.Lock()
 			pos.TP1Done = true
 			e.positionsMu.Unlock()
-			log.Printf("ExecutionAgent: ✅ TP1 sell complete: %s\n", txHash)
+			log.Printf("ExecutionAgent: ✅ TP1 sell complete: %s (est %.4f SOL recovered)\n", txHash, estSol)
 		}
 		return
 	}
@@ -711,10 +872,13 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		if err != nil {
 			log.Printf("ExecutionAgent: TP2 sell failed: %v\n", err)
 		} else {
+			// Recovered ~25% of position at 3x = ~0.75x of original stake
+			estSol := pos.SolSpent * mult * 0.25
+			e.recordSellTx(mint, txHash, estSol)
 			e.positionsMu.Lock()
 			pos.TP2Done = true
 			e.positionsMu.Unlock()
-			log.Printf("ExecutionAgent: ✅ TP2 sell complete: %s\n", txHash)
+			log.Printf("ExecutionAgent: ✅ TP2 sell complete: %s (est %.4f SOL recovered)\n", txHash, estSol)
 		}
 		return
 	}
@@ -730,9 +894,10 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		if err != nil {
 			log.Printf("ExecutionAgent: Trailing stop sell failed: %v\n", err)
 		} else {
-			e.positionsMu.Lock()
-			delete(e.positions, mint)
-			e.positionsMu.Unlock()
+			// Estimate SOL received from current price * tokens
+			estSol := e.estimateCurrentSolValue(mint, pos.SolSpent, mult)
+			e.recordSellTx(mint, txHash, estSol)
+			e.recordOutcome(mint, "trailing_stop")
 			log.Printf("ExecutionAgent: ✅ Position closed via trailing stop: %s\n", txHash)
 		}
 		return
@@ -747,9 +912,9 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		if err != nil {
 			log.Printf("ExecutionAgent: Stop loss sell failed: %v\n", err)
 		} else {
-			e.positionsMu.Lock()
-			delete(e.positions, mint)
-			e.positionsMu.Unlock()
+			estSol := e.estimateCurrentSolValue(mint, pos.SolSpent, mult)
+			e.recordSellTx(mint, txHash, estSol)
+			e.recordOutcome(mint, "stop_loss")
 			log.Printf("ExecutionAgent: ✅ Position closed via stop loss: %s\n", txHash)
 		}
 		return
@@ -765,13 +930,18 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		if err != nil {
 			log.Printf("ExecutionAgent: Timeout sell failed: %v\n", err)
 		} else {
-			e.positionsMu.Lock()
-			delete(e.positions, mint)
-			e.positionsMu.Unlock()
+			estSol := e.estimateCurrentSolValue(mint, pos.SolSpent, mult)
+			e.recordSellTx(mint, txHash, estSol)
+			e.recordOutcome(mint, "timeout")
 			log.Printf("ExecutionAgent: ✅ Position closed via timeout: %s\n", txHash)
 		}
 		return
 	}
+}
+
+// estimateCurrentSolValue estimates how much SOL the remaining position is worth
+func (e *ExecutionAgent) estimateCurrentSolValue(mint string, originalSol, currentMult float64) float64 {
+	return originalSol * currentMult
 }
 
 // ─── Public interface ─────────────────────────────────────────────────────────
@@ -828,9 +998,7 @@ func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.Candidat
 		}
 		if bal == 0 {
 			log.Printf("ExecutionAgent: ⚠️  Buy completed but 0 tokens received — dropping %s (likely failed on-chain)\n", candidate.Token.TokenAddress)
-			e.positionsMu.Lock()
-			delete(e.positions, candidate.Token.TokenAddress)
-			e.positionsMu.Unlock()
+			e.recordOutcome(candidate.Token.TokenAddress, "phantom")
 		} else {
 			log.Printf("ExecutionAgent: ✓ Verified %d tokens received for %s\n", bal, candidate.Token.TokenAddress[:10])
 		}
@@ -859,3 +1027,4 @@ func (e *ExecutionAgent) GetSignerType() string {
 	}
 	return "none"
 }
+
