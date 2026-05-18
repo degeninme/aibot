@@ -399,8 +399,7 @@ func (s *ChainScannerAgent) scanWithHelius() {
 				Pair: "pumpfun",
 			},
 			Metadata: map[string]string{
-				"source":  "pumpfun",
-				"dev_pct": fmt.Sprintf("%.2f", devResult.devPct),
+				"source": "pumpfun",
 			},
 		}
 
