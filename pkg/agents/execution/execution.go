@@ -442,7 +442,20 @@ func (e *ExecutionAgent) sellOnPumpFun(ctx context.Context, mint string, percent
 	if e.privateKey == nil {
 		return "", fmt.Errorf("no private key configured")
 	}
-	log.Printf("ExecutionAgent: Selling %d%% of mint=%s\n", percentage, mint)
+
+	// Check actual token balance first — if zero, position is phantom
+	bal, _, err := e.fetchTokenBalance(mint)
+	if err != nil {
+		log.Printf("ExecutionAgent: Could not check token balance: %v\n", err)
+	} else if bal == 0 {
+		log.Printf("ExecutionAgent: Token balance is 0 for %s — dropping phantom position\n", mint)
+		e.positionsMu.Lock()
+		delete(e.positions, mint)
+		e.positionsMu.Unlock()
+		return "", fmt.Errorf("zero balance — position dropped")
+	}
+
+	log.Printf("ExecutionAgent: Selling %d%% of mint=%s (holding %d tokens)\n", percentage, mint, bal)
 
 	txB64, err := e.getSwapTransactionSell(mint, percentage)
 	if err != nil {
@@ -453,6 +466,15 @@ func (e *ExecutionAgent) sellOnPumpFun(ctx context.Context, mint string, percent
 		return "", fmt.Errorf("signTransaction: %w", err)
 	}
 	if err := e.simulateTransaction(signedTx); err != nil {
+		// Detect SellZeroAmount (6022) - means we don't actually hold the token
+		errStr := err.Error()
+		if bytes.Contains([]byte(errStr), []byte("6022")) ||
+			bytes.Contains([]byte(errStr), []byte("SellZeroAmount")) {
+			log.Printf("ExecutionAgent: SellZeroAmount detected — dropping phantom position %s\n", mint)
+			e.positionsMu.Lock()
+			delete(e.positions, mint)
+			e.positionsMu.Unlock()
+		}
 		return "", fmt.Errorf("sell simulation failed: %w", err)
 	}
 	log.Println("ExecutionAgent: Sell simulation passed ✓")
@@ -796,6 +818,24 @@ func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.Candidat
 	// Record the position for monitoring
 	e.recordPosition(candidate.Token.TokenAddress, solAmount, txHash)
 
+	// Wait briefly for tx to settle, then verify we actually got tokens
+	go func() {
+		time.Sleep(15 * time.Second)
+		bal, _, err := e.fetchTokenBalance(candidate.Token.TokenAddress)
+		if err != nil {
+			log.Printf("ExecutionAgent: Post-buy balance check failed: %v\n", err)
+			return
+		}
+		if bal == 0 {
+			log.Printf("ExecutionAgent: ⚠️  Buy completed but 0 tokens received — dropping %s (likely failed on-chain)\n", candidate.Token.TokenAddress)
+			e.positionsMu.Lock()
+			delete(e.positions, candidate.Token.TokenAddress)
+			e.positionsMu.Unlock()
+		} else {
+			log.Printf("ExecutionAgent: ✓ Verified %d tokens received for %s\n", bal, candidate.Token.TokenAddress[:10])
+		}
+	}()
+
 	// Refresh cached balance after buy
 	if bal, err := e.fetchWalletBalanceSOL(); err == nil {
 		e.balanceMu.Lock()
@@ -819,4 +859,3 @@ func (e *ExecutionAgent) GetSignerType() string {
 	}
 	return "none"
 }
-
