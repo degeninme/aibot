@@ -44,6 +44,7 @@ func startAPIServer(cfg *config.Config) {
 	router.HandleFunc("/api/metrics", metricsHandler).Methods("GET")
 	router.HandleFunc("/api/risk", riskHandler).Methods("GET")
 	router.HandleFunc("/api/risk/resume", resumeTradingHandler).Methods("POST")
+	router.HandleFunc("/api/trades", tradesHandler).Methods("GET")
 	
 	// Serve frontend static files for all other routes
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./frontend")))
@@ -166,5 +167,18 @@ func resumeTradingHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]string{
 		"status":  "ok",
 		"message": "Trading resumed",
+	})
+}
+
+// Trades endpoint - returns all closed trade outcomes
+func tradesHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	execAgent := orch.GetExecution()
+	trades := execAgent.GetClosedTrades()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"count":  len(trades),
+		"trades": trades,
 	})
 }
