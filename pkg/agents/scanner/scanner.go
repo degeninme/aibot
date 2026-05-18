@@ -183,25 +183,36 @@ func (s *ChainScannerAgent) GetTokenChannel() <-chan models.TokenFound {
 func (s *ChainScannerAgent) pollAllKOLsLoop() {
 	defer s.wg.Done()
 
-	// Use a separate goroutine per wallet so a single slow KOL doesn't block others
+	// Stagger startup: launch one goroutine per wallet but space them 300ms apart
+	// to avoid hitting RPC rate limits during the initial signature priming
+	i := 0
 	for addr, name := range s.kolWallets {
 		s.wg.Add(1)
-		go s.pollKOLWallet(addr, name)
+		go s.pollKOLWallet(addr, name, time.Duration(i*300)*time.Millisecond)
+		i++
 	}
 
-	// Wait for context cancellation
 	<-s.ctx.Done()
 }
 
-func (s *ChainScannerAgent) pollKOLWallet(addr, name string) {
+func (s *ChainScannerAgent) pollKOLWallet(addr, name string, startDelay time.Duration) {
 	defer s.wg.Done()
 
-	// Poll every 3 seconds — fast enough to catch buys quickly,
-	// slow enough to keep RPC usage reasonable across 15 wallets
-	ticker := time.NewTicker(3 * time.Second)
+	// Initial delay to spread out priming across wallets
+	if startDelay > 0 {
+		select {
+		case <-s.ctx.Done():
+			return
+		case <-time.After(startDelay):
+		}
+	}
+
+	// Poll every 5 seconds — gives us 15 wallets × ~1 req each = ~3 req/sec
+	// well within Helius free tier limits
+	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
 
-	// Initial backfill: mark recent sigs as seen so we don't act on old txs at startup
+	// Initial backfill: mark recent sigs as seen so we don't act on old txs
 	if sigs, err := s.getRecentSignatures(addr, 10); err == nil {
 		s.seenSigsMu.Lock()
 		for _, sig := range sigs {
@@ -209,6 +220,8 @@ func (s *ChainScannerAgent) pollKOLWallet(addr, name string) {
 		}
 		s.seenSigsMu.Unlock()
 		log.Printf("ChainScannerAgent: %s — primed with %d recent sigs\n", name, len(sigs))
+	} else {
+		log.Printf("ChainScannerAgent: %s — prime failed: %v (will retry on first tick)\n", name, err)
 	}
 
 	for {
@@ -403,24 +416,43 @@ func (s *ChainScannerAgent) getRecentSignatures(address string, limit int) ([]si
 }
 
 func (s *ChainScannerAgent) getTransaction(sig string) (*txResult, error) {
-	resp, err := s.rpcCall("getTransaction", []interface{}{
-		sig,
-		map[string]interface{}{
-			"encoding":                       "json",
-			"maxSupportedTransactionVersion": 0,
-		},
-	})
-	if err != nil {
-		return nil, err
+	// Retry up to 3 times on rate limit (with backoff)
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		if attempt > 0 {
+			// Wait 500ms × attempt before retrying
+			select {
+			case <-s.ctx.Done():
+				return nil, s.ctx.Err()
+			case <-time.After(time.Duration(attempt) * 500 * time.Millisecond):
+			}
+		}
+
+		resp, err := s.rpcCall("getTransaction", []interface{}{
+			sig,
+			map[string]interface{}{
+				"encoding":                       "json",
+				"maxSupportedTransactionVersion": 0,
+			},
+		})
+		if err != nil {
+			lastErr = err
+			// Only retry on rate limit, fail fast on other errors
+			if strings.Contains(err.Error(), "-32429") || strings.Contains(err.Error(), "rate limited") {
+				continue
+			}
+			return nil, err
+		}
+		if string(resp.Result) == "null" {
+			return nil, nil
+		}
+		var tx txResult
+		if err := json.Unmarshal(resp.Result, &tx); err != nil {
+			return nil, err
+		}
+		return &tx, nil
 	}
-	if string(resp.Result) == "null" {
-		return nil, nil
-	}
-	var tx txResult
-	if err := json.Unmarshal(resp.Result, &tx); err != nil {
-		return nil, err
-	}
-	return &tx, nil
+	return nil, lastErr
 }
 
 func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
