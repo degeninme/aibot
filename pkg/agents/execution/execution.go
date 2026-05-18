@@ -1027,4 +1027,3 @@ func (e *ExecutionAgent) GetSignerType() string {
 	}
 	return "none"
 }
-
