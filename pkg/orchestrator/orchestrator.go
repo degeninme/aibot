@@ -43,14 +43,16 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 
 	exec := execution.NewExecutionAgent(cfg)
 	riskMgr := risk.NewRiskManagerAgent(cfg)
+	strategyAgent := strategy.NewStrategyEvaluatorAgent(cfg)
 
-	// Wire up live wallet balance to risk manager
-	riskMgr.SetBalanceProvider(func() float64 {
+	// Wire up live wallet balance to risk manager AND strategy
+	balanceProvider := func() float64 {
 		return exec.GetWalletBalanceUSD()
-	})
+	}
+	riskMgr.SetBalanceProvider(balanceProvider)
+	strategyAgent.SetBalanceProvider(balanceProvider)
 
 	// Start a goroutine that keeps risk exposure in sync with actual open positions
-	// This handles cases where the user manually sold tokens
 	go func() {
 		ticker := time.NewTicker(30 * time.Second)
 		defer ticker.Stop()
@@ -66,7 +68,7 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		prefilter: prefilter.NewPreFilterAgent(cfg),
 		safety:    safety.NewOnChainSafetyAgent(cfg),
 		offchain:  offchain.NewOffChainDataAgent(cfg),
-		strategy:  strategy.NewStrategyEvaluatorAgent(cfg),
+		strategy:  strategyAgent,
 		listing:   listing.NewCandidateListingAgent(),
 		execution: exec,
 		risk:      riskMgr,
