@@ -3,18 +3,45 @@ package strategy
 import (
 	"log"
 	"math"
+	"math/rand"
+	"sync"
 	"time"
 
 	"github.com/mumugogoing/meme_bot/pkg/config"
 	"github.com/mumugogoing/meme_bot/pkg/models"
 )
 
+// BalanceProvider returns the live floating account balance in USD
+type BalanceProvider func() float64
+
 type StrategyEvaluatorAgent struct {
-	config *config.Config
+	config          *config.Config
+	balanceProvider BalanceProvider
+	mu              sync.RWMutex
 }
 
 func NewStrategyEvaluatorAgent(cfg *config.Config) *StrategyEvaluatorAgent {
 	return &StrategyEvaluatorAgent{config: cfg}
+}
+
+// SetBalanceProvider wires up the live balance source
+func (s *StrategyEvaluatorAgent) SetBalanceProvider(p BalanceProvider) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.balanceProvider = p
+	log.Println("StrategyEvaluatorAgent: Live balance provider configured")
+}
+
+// liveBalance returns the floating balance (USD), falling back to config.AccountBalance
+func (s *StrategyEvaluatorAgent) liveBalance() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.balanceProvider != nil {
+		if b := s.balanceProvider(); b > 0 {
+			return b
+		}
+	}
+	return s.config.AccountBalance
 }
 
 func (s *StrategyEvaluatorAgent) Evaluate(
@@ -168,7 +195,27 @@ func (s *StrategyEvaluatorAgent) determineAction(decision *models.StrategyDecisi
 }
 
 func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.StrategyDecision) float64 {
-	maxPosition := s.config.AccountBalance * s.config.SinglePositionPct
+	// Use floating live balance (USD) instead of static config
+	balance := s.liveBalance()
+
+	// Reserve some SOL for transaction fees & rent — equivalent to ~0.02 SOL at $86 = ~$1.72
+	// Keep $2 reserve to be safe
+	const reserveUSD = 2.0
+
+	available := balance - reserveUSD
+	if available <= 0.5 {
+		log.Printf("StrategyEvaluatorAgent: Balance too low ($%.2f, reserve=$%.2f) — skipping\n",
+			balance, reserveUSD)
+		return 0
+	}
+
+	// Cap by single position percentage
+	maxPosition := available * s.config.SinglePositionPct
+	if maxPosition > available {
+		maxPosition = available
+	}
+
+	// Apply confidence multiplier
 	multiplier := 1.0
 	switch decision.Confidence {
 	case "medium":
@@ -176,11 +223,27 @@ func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.Strategy
 	case "low":
 		multiplier = 0.4
 	}
-	suggested := maxPosition * multiplier
-	if suggested < 10 {
-		suggested = 10
+
+	target := maxPosition * multiplier
+
+	// Randomize 70-100% of target to vary entry sizes (helps with diversification)
+	jitter := 0.7 + rand.Float64()*0.3
+	suggested := target * jitter
+
+	// Floor at $0.50 to avoid dust trades that don't cover fees
+	if suggested < 0.5 {
+		suggested = 0.5
 	}
-	return math.Round(suggested*100) / 100
+
+	// Don't suggest more than what's available
+	if suggested > available {
+		suggested = available
+	}
+
+	rounded := math.Round(suggested*100) / 100
+	log.Printf("StrategyEvaluatorAgent: Position size — balance=$%.2f available=$%.2f maxPos=$%.2f → $%.2f\n",
+		balance, available, maxPosition, rounded)
+	return rounded
 }
 
 func (s *StrategyEvaluatorAgent) calculateStopLoss(decision *models.StrategyDecision) float64 {
