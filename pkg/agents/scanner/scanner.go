@@ -77,6 +77,7 @@ type tokenBalance struct {
 type heliusTx struct {
 	Signature   string `json:"signature"`
 	Type        string `json:"type"`
+	Description string `json:"description"`
 	TokenMint   string `json:"tokenMint"`
 	FeePayer    string `json:"feePayer"`
 	Timestamp   int64  `json:"timestamp"`
@@ -85,6 +86,11 @@ type heliusTx struct {
 			Mint string `json:"mint"`
 		} `json:"token"`
 	} `json:"events"`
+	Instructions []struct {
+		Data        string `json:"data"`
+		ProgramID   string `json:"programId"`
+		Accounts    []string `json:"accounts"`
+	} `json:"instructions"`
 	AccountData []struct {
 		Account string `json:"account"`
 	} `json:"accountData"`
@@ -299,8 +305,8 @@ func (s *ChainScannerAgent) scanSolanaNewTokens() {
 		s.scanProgram(PumpFunProgram, "pumpfun", 200)
 	}
 
-	// PumpSwap: graduated tokens
-	s.scanProgram(PumpSwapProgram, "pumpswap", 10)
+	// PumpSwap scanning disabled — mostly buy/sell noise, not new token creates
+	// s.scanProgram(PumpSwapProgram, "pumpswap", 10)
 }
 
 // scanWithHelius uses Helius enhanced API to get token creation events
@@ -371,6 +377,16 @@ func (s *ChainScannerAgent) scanWithHelius() {
 			continue
 		}
 
+		// Always fetch full tx to check for mayhem mode in logs
+		// This adds 1 RPC call per token but ensures we never buy mayhem tokens
+		fullTx, err := s.getTransaction(tx.Signature)
+		if err == nil && fullTx != nil && fullTx.Meta.Err == nil {
+			if isMayhemFromLogs(fullTx.Meta.LogMessages) {
+				log.Printf("ChainScannerAgent: Skipping mayhem mode token: %s\n", mint)
+				continue
+			}
+		}
+
 		token := &models.TokenFound{
 			Chain:          models.ChainSolana,
 			TokenAddress:   mint,
@@ -388,6 +404,19 @@ func (s *ChainScannerAgent) scanWithHelius() {
 		s.emitTokenFound(*token)
 	}
 	log.Printf("ChainScannerAgent: [helius/pumpfun] %d new tokens found\n", found)
+}
+
+// isMayhemFromLogs returns true if any log message indicates mayhem mode
+func isMayhemFromLogs(logs []string) bool {
+	for _, msg := range logs {
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "mayhem") ||
+			strings.Contains(lower, "is_mayhem_mode: true") ||
+			strings.Contains(lower, "ismayhem") {
+			return true
+		}
+	}
+	return false
 }
 
 // scanProgram is the raw RPC fallback — fetches many sigs and looks for creates
@@ -455,15 +484,26 @@ func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source stri
 	if source == "pumpfun" {
 		// Only process create_v2 instructions — skip Sell/Buy/other
 		isCreate := false
+		isMayhem := false
 		for _, msg := range logs {
 			if strings.Contains(msg, "Instruction: Create") ||
 				strings.Contains(msg, "create_v2") ||
 				strings.Contains(msg, "CreateV2") {
 				isCreate = true
-				break
+			}
+			// Mayhem mode tokens log indicators in the create instruction
+			lowerMsg := strings.ToLower(msg)
+			if strings.Contains(lowerMsg, "mayhem") ||
+				strings.Contains(lowerMsg, "is_mayhem_mode: true") ||
+				strings.Contains(lowerMsg, "ismayhem") {
+				isMayhem = true
 			}
 		}
 		if !isCreate {
+			return nil
+		}
+		if isMayhem {
+			log.Printf("ChainScannerAgent: Skipping mayhem mode token (from logs): %s\n", txHash[:20])
 			return nil
 		}
 
