@@ -18,9 +18,31 @@ import (
 )
 
 const (
-	PumpFunProgram  = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
-	PumpSwapProgram = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
+	PumpFunProgram = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 )
+
+// ─── KOL wallets to track ────────────────────────────────────────────────────
+// Override via KOL_WALLETS env var (comma-separated "addr:name" pairs).
+
+var defaultKOLs = map[string]string{
+	"525LueqAyZJueCoiisfWy6nyh4MTvmF4X9jSqi6efXJT": "JOJI",
+	"CyaE1VxvBrahnPWkqm5VsdCvyS2QmNht2UFrKJHga54o": "CENTED",
+	"Bi4rd5FH5bYEN8scZ7wevxNZyNmKHdaBcvewdPFxYdLt": "THEO",
+	"AuPp4YTMTyqxYXQnHc5KUc6pUuCSsHQpBJhgnD45yqrf": "DANI",
+	"8rvAsDKeAcEjEkiZMug9k8v1y8mW6gQQiMobd89Uy7qR": "CASINO",
+	"4vw54BmAogeRV3vPKWyFet5yf8DTLcREzdSzx4rw9Ud9": "DECU",
+	"7bsTkeWcSPG6nzsbXucxV89YUULoSExNJdX2WqfLHwZ4": "BIGWARZ",
+	"5B79fMkcFeRTiwm7ehsZsFiKsC7m7n1Bgv9yLxPp9q2X": "BANDIT",
+	"FAicXNV5FVqtfbpn4Zccs71XcfGeyxBSGbqLDyDJZjke": "RADIANCE",
+	"4BdKaxN8G6ka4GYtQQWk4G4dZRUTX2vQH9GcXdBREFUk": "JIJO",
+	"5ZuV8eqkvzYFVEKbLvGBdexL2tFv7E5BCd2HZpjqbdg":  "DOKI",
+	"B32QbbdDAyhvUQzjcaM5j6ZVKwjCxAwGH5Xgvb9SJqnC": "KADINOX",
+	"8MaVa9kdt3NW4Q5HyNAm1X5LbR8PQRVDc1W8NMVK88D5": "DAUMEN",
+	"4nwfXw7n98jEQn93VWY7Cuf1jnn1scHXuXCPGVYS9k6T": "FROST",
+	"3BLjRcxWGtR7WRshJ3hL25U3RjWr5Ud98wMcczQqk4Ei": "SEBIASTEIN",
+}
+
+// ─── RPC types ────────────────────────────────────────────────────────────────
 
 type rpcRequest struct {
 	Jsonrpc string        `json:"jsonrpc"`
@@ -46,7 +68,6 @@ type signatureInfo struct {
 	Slot      uint64      `json:"slot"`
 	Err       interface{} `json:"err"`
 	BlockTime *int64      `json:"blockTime"`
-	Memo      *string     `json:"memo"`
 }
 
 type txResult struct {
@@ -73,28 +94,7 @@ type tokenBalance struct {
 	} `json:"uiTokenAmount"`
 }
 
-// heliusTx is used for Helius enhanced transaction parsing
-type heliusTx struct {
-	Signature   string `json:"signature"`
-	Type        string `json:"type"`
-	Description string `json:"description"`
-	TokenMint   string `json:"tokenMint"`
-	FeePayer    string `json:"feePayer"`
-	Timestamp   int64  `json:"timestamp"`
-	Events      struct {
-		Token *struct {
-			Mint string `json:"mint"`
-		} `json:"token"`
-	} `json:"events"`
-	Instructions []struct {
-		Data        string `json:"data"`
-		ProgramID   string `json:"programId"`
-		Accounts    []string `json:"accounts"`
-	} `json:"instructions"`
-	AccountData []struct {
-		Account string `json:"account"`
-	} `json:"accountData"`
-}
+// ─── ChainScannerAgent ────────────────────────────────────────────────────────
 
 type ChainScannerAgent struct {
 	config       *config.Config
@@ -103,25 +103,21 @@ type ChainScannerAgent struct {
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 	httpClient   *http.Client
-	seenSigs     map[string]bool
-	seenSigsMu   sync.Mutex
-	seenMints    map[string]bool
-	seenMintsMu  sync.Mutex
-	heliusAPIKey string
+
+	kolWallets  map[string]string // address → name
+	rpcURL      string
+	seenSigs    map[string]bool
+	seenSigsMu  sync.Mutex
+	seenMints   map[string]bool
+	seenMintsMu sync.Mutex
 }
 
 func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
 	ctx, cancel := context.WithCancel(context.Background())
 
-	// Extract Helius API key from RPC URL if present
-	// e.g. https://mainnet.helius-rpc.com/?api-key=XXXXX
-	apiKey := ""
-	rpcURL := cfg.SolanaRPCURL
-	if idx := strings.Index(rpcURL, "api-key="); idx != -1 {
-		apiKey = rpcURL[idx+8:]
-		if end := strings.Index(apiKey, "&"); end != -1 {
-			apiKey = apiKey[:end]
-		}
+	kols := loadKOLsFromEnv()
+	if len(kols) == 0 {
+		kols = defaultKOLs
 	}
 
 	return &ChainScannerAgent{
@@ -130,26 +126,44 @@ func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
 		ctx:          ctx,
 		cancel:       cancel,
 		httpClient:   &http.Client{Timeout: 15 * time.Second},
+		kolWallets:   kols,
+		rpcURL:       cfg.SolanaRPCURL,
 		seenSigs:     make(map[string]bool),
 		seenMints:    make(map[string]bool),
-		heliusAPIKey: apiKey,
 	}
 }
 
+func loadKOLsFromEnv() map[string]string {
+	envStr := os.Getenv("KOL_WALLETS")
+	if envStr == "" {
+		return nil
+	}
+	result := make(map[string]string)
+	parts := strings.Split(envStr, ",")
+	for i, p := range parts {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if idx := strings.Index(p, ":"); idx > 0 {
+			result[p[:idx]] = strings.TrimSpace(p[idx+1:])
+		} else {
+			result[p] = fmt.Sprintf("KOL%d", i+1)
+		}
+	}
+	return result
+}
+
 func (s *ChainScannerAgent) Start() {
-	log.Println("ChainScannerAgent: Starting chain monitoring...")
+	log.Printf("ChainScannerAgent: Starting KOL tracker for %d wallets:\n", len(s.kolWallets))
+	for addr, name := range s.kolWallets {
+		log.Printf("  • %s (%s...)\n", name, addr[:8])
+	}
+
 	s.wg.Add(1)
-	go s.scanSolana()
-	if os.Getenv("BASE_RPC_URL") != "" {
-		s.wg.Add(1)
-		go s.scanBase()
-	} else {
-		log.Println("ChainScannerAgent: BASE_RPC_URL not set, skipping Base chain scanning")
-	}
-	if s.heliusAPIKey != "" {
-		log.Println("ChainScannerAgent: Helius API key detected - using enhanced transaction API")
-	}
-	log.Println("ChainScannerAgent: Chain monitoring started")
+	go s.pollAllKOLsLoop()
+
+	log.Println("ChainScannerAgent: KOL tracker started (polling every 3s)")
 }
 
 func (s *ChainScannerAgent) Stop() {
@@ -164,42 +178,192 @@ func (s *ChainScannerAgent) GetTokenChannel() <-chan models.TokenFound {
 	return s.tokenChannel
 }
 
-func (s *ChainScannerAgent) scanSolana() {
+// ─── Polling loop ─────────────────────────────────────────────────────────────
+
+func (s *ChainScannerAgent) pollAllKOLsLoop() {
 	defer s.wg.Done()
-	ticker := time.NewTicker(s.config.ScanIntervalSolana)
+
+	// Use a separate goroutine per wallet so a single slow KOL doesn't block others
+	for addr, name := range s.kolWallets {
+		s.wg.Add(1)
+		go s.pollKOLWallet(addr, name)
+	}
+
+	// Wait for context cancellation
+	<-s.ctx.Done()
+}
+
+func (s *ChainScannerAgent) pollKOLWallet(addr, name string) {
+	defer s.wg.Done()
+
+	// Poll every 3 seconds — fast enough to catch buys quickly,
+	// slow enough to keep RPC usage reasonable across 15 wallets
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-	log.Printf("ChainScannerAgent: Solana scanner started (interval: %v)\n", s.config.ScanIntervalSolana)
+
+	// Initial backfill: mark recent sigs as seen so we don't act on old txs at startup
+	if sigs, err := s.getRecentSignatures(addr, 10); err == nil {
+		s.seenSigsMu.Lock()
+		for _, sig := range sigs {
+			s.seenSigs[sig.Signature] = true
+		}
+		s.seenSigsMu.Unlock()
+		log.Printf("ChainScannerAgent: %s — primed with %d recent sigs\n", name, len(sigs))
+	}
+
 	for {
 		select {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
-			s.scanSolanaNewTokens()
+			s.checkKOLForNewBuys(addr, name)
 		}
 	}
 }
 
-func (s *ChainScannerAgent) scanBase() {
-	defer s.wg.Done()
-	ticker := time.NewTicker(s.config.ScanIntervalBase)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-s.ctx.Done():
-			return
-		case <-ticker.C:
-			s.scanBaseNewTokens()
+func (s *ChainScannerAgent) checkKOLForNewBuys(addr, name string) {
+	sigs, err := s.getRecentSignatures(addr, 5)
+	if err != nil {
+		// Don't spam logs — RPC errors are usually transient
+		return
+	}
+
+	for _, sig := range sigs {
+		if sig.Err != nil {
+			continue
 		}
+
+		s.seenSigsMu.Lock()
+		if s.seenSigs[sig.Signature] {
+			s.seenSigsMu.Unlock()
+			continue
+		}
+		s.seenSigs[sig.Signature] = true
+		if len(s.seenSigs) > 5000 {
+			s.pruneSeen()
+		}
+		s.seenSigsMu.Unlock()
+
+		// Process in background so one slow tx doesn't block others
+		go s.processKOLTransaction(sig.Signature, addr, name)
 	}
 }
+
+func (s *ChainScannerAgent) processKOLTransaction(sig, kolAddr, kolName string) {
+	tx, err := s.getTransaction(sig)
+	if err != nil {
+		log.Printf("ChainScannerAgent: Could not fetch %s tx %s: %v\n", kolName, sig[:16], err)
+		return
+	}
+	if tx == nil || tx.Meta.Err != nil {
+		return
+	}
+
+	// Check transaction logs for PumpFun + Buy + not Mayhem
+	hasPumpFun := false
+	isBuy := false
+	isSell := false
+	isMayhem := false
+
+	for _, msg := range tx.Meta.LogMessages {
+		if strings.Contains(msg, PumpFunProgram) {
+			hasPumpFun = true
+		}
+		lower := strings.ToLower(msg)
+		if strings.Contains(lower, "instruction: buy") {
+			isBuy = true
+		}
+		if strings.Contains(lower, "instruction: sell") {
+			isSell = true
+		}
+		if strings.Contains(lower, "mayhem") ||
+			strings.Contains(lower, "is_mayhem_mode: true") {
+			isMayhem = true
+		}
+	}
+
+	if !hasPumpFun || isSell || !isBuy {
+		return
+	}
+
+	if isMayhem {
+		log.Printf("ChainScannerAgent: %s bought a MAYHEM token — skipping\n", kolName)
+		return
+	}
+
+	// Find the PumpFun mint
+	mint := ""
+	for _, bal := range tx.Meta.PostTokenBalances {
+		if bal.Owner == kolAddr && strings.HasSuffix(bal.Mint, "pump") {
+			mint = bal.Mint
+			break
+		}
+	}
+	if mint == "" {
+		// Fallback — any mint ending in "pump"
+		for _, bal := range tx.Meta.PostTokenBalances {
+			if strings.HasSuffix(bal.Mint, "pump") {
+				mint = bal.Mint
+				break
+			}
+		}
+	}
+	if mint == "" {
+		// Last resort — scan account keys
+		for _, acc := range tx.Transaction.Message.AccountKeys {
+			if strings.HasSuffix(acc, "pump") {
+				mint = acc
+				break
+			}
+		}
+	}
+	if mint == "" {
+		return
+	}
+
+	// Deduplicate by mint — multiple KOLs buying same token = first one wins
+	s.seenMintsMu.Lock()
+	if s.seenMints[mint] {
+		s.seenMintsMu.Unlock()
+		log.Printf("ChainScannerAgent: %s bought %s — already bought from another KOL\n", kolName, mint[:10])
+		return
+	}
+	s.seenMints[mint] = true
+	s.seenMintsMu.Unlock()
+
+	log.Printf("ChainScannerAgent: 🎯 KOL BUY — %s bought %s | sig=%s\n",
+		kolName, mint, sig[:16])
+
+	ts := time.Now().Unix()
+	if tx.BlockTime != nil {
+		ts = *tx.BlockTime
+	}
+
+	token := models.TokenFound{
+		Chain:          models.ChainSolana,
+		TokenAddress:   mint,
+		FirstSeenTS:    ts,
+		CreatorAddress: kolAddr,
+		TxHash:         sig,
+		InitialLiquidity: models.InitialLiquidity{
+			Pair: "pumpfun",
+		},
+		Metadata: map[string]string{
+			"source":   "kol_tracker",
+			"kol_name": kolName,
+			"kol_addr": kolAddr,
+		},
+	}
+
+	s.emitTokenFound(token)
+}
+
+// ─── Shared RPC helpers ───────────────────────────────────────────────────────
 
 func (s *ChainScannerAgent) rpcCall(method string, params []interface{}) (*rpcResponse, error) {
 	req := rpcRequest{Jsonrpc: "2.0", ID: 1, Method: method, Params: params}
-	body, err := json.Marshal(req)
-	if err != nil {
-		return nil, err
-	}
-	httpReq, err := http.NewRequestWithContext(s.ctx, "POST", s.config.SolanaRPCURL, bytes.NewReader(body))
+	body, _ := json.Marshal(req)
+	httpReq, err := http.NewRequestWithContext(s.ctx, "POST", s.rpcURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -213,19 +377,19 @@ func (s *ChainScannerAgent) rpcCall(method string, params []interface{}) (*rpcRe
 	if err != nil {
 		return nil, err
 	}
-	var rpcResp rpcResponse
-	if err := json.Unmarshal(respBody, &rpcResp); err != nil {
+	var rr rpcResponse
+	if err := json.Unmarshal(respBody, &rr); err != nil {
 		return nil, err
 	}
-	if rpcResp.Error != nil {
-		return nil, fmt.Errorf("RPC error %d: %s", rpcResp.Error.Code, rpcResp.Error.Message)
+	if rr.Error != nil {
+		return nil, fmt.Errorf("RPC %s error %d: %s", method, rr.Error.Code, rr.Error.Message)
 	}
-	return &rpcResp, nil
+	return &rr, nil
 }
 
-func (s *ChainScannerAgent) getRecentSignatures(programID string, limit int) ([]signatureInfo, error) {
+func (s *ChainScannerAgent) getRecentSignatures(address string, limit int) ([]signatureInfo, error) {
 	resp, err := s.rpcCall("getSignaturesForAddress", []interface{}{
-		programID,
+		address,
 		map[string]interface{}{"limit": limit, "commitment": "confirmed"},
 	})
 	if err != nil {
@@ -259,355 +423,15 @@ func (s *ChainScannerAgent) getTransaction(sig string) (*txResult, error) {
 	return &tx, nil
 }
 
-// getHeliusEnhancedTxs uses Helius enhanced transactions API to get
-// only CREATE type transactions for PumpFun - much more efficient
-func (s *ChainScannerAgent) getHeliusEnhancedTxs(limit int) ([]heliusTx, error) {
-	url := fmt.Sprintf("https://api.helius.xyz/v0/addresses/%s/transactions?api-key=%s&limit=%d",
-		PumpFunProgram, s.heliusAPIKey, limit)
-
-	httpReq, err := http.NewRequestWithContext(s.ctx, "GET", url, nil)
-	if err != nil {
-		return nil, err
-	}
-
-	resp, err := s.httpClient.Do(httpReq)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, err
-	}
-
-	var txs []heliusTx
-	if err := json.Unmarshal(body, &txs); err != nil {
-		return nil, fmt.Errorf("helius parse error: %w (body: %s)", err, string(body[:min(200, len(body))]))
-	}
-	return txs, nil
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func (s *ChainScannerAgent) scanSolanaNewTokens() {
-	log.Println("ChainScannerAgent: Scanning Solana for new tokens...")
-
-	// Use Helius enhanced API if we have a key — fetch recent txs and filter for create_v2
-	if s.heliusAPIKey != "" {
-		s.scanWithHelius()
-	} else {
-		// Fallback: raw RPC with large limit — creates are rare among buys/sells
-		s.scanProgram(PumpFunProgram, "pumpfun", 200)
-	}
-
-	// PumpSwap scanning disabled — mostly buy/sell noise, not new token creates
-	// s.scanProgram(PumpSwapProgram, "pumpswap", 10)
-}
-
-// scanWithHelius uses Helius enhanced API to get token creation events
-func (s *ChainScannerAgent) scanWithHelius() {
-	txs, err := s.getHeliusEnhancedTxs(50)
-	if err != nil {
-		log.Printf("ChainScannerAgent: Helius API error: %v, falling back to raw RPC\n", err)
-		s.scanProgram(PumpFunProgram, "pumpfun", 200)
+func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
+	select {
+	case s.tokenChannel <- token:
+		log.Printf("ChainScannerAgent: Token emitted to pipeline — %s\n", token.TokenAddress)
+	case <-s.ctx.Done():
 		return
+	default:
+		log.Println("ChainScannerAgent: Warning — token channel full, dropping event")
 	}
-
-	found := 0
-	for _, tx := range txs {
-		// Only process create_v2 instructions
-		isCreate := strings.Contains(strings.ToLower(tx.Type), "create") ||
-			strings.Contains(strings.ToLower(tx.Type), "mint")
-		if !isCreate {
-			continue
-		}
-
-		// Skip seen signatures
-		s.seenSigsMu.Lock()
-		seen := s.seenSigs[tx.Signature]
-		if !seen {
-			s.seenSigs[tx.Signature] = true
-		}
-		s.seenSigsMu.Unlock()
-		if seen {
-			continue
-		}
-
-		// Extract mint — must end in "pump"
-		mint := tx.TokenMint
-		if mint == "" && tx.Events.Token != nil {
-			mint = tx.Events.Token.Mint
-		}
-		// If Helius doesn't give us the mint directly, fall back to full tx fetch
-		if mint == "" || !strings.HasSuffix(mint, "pump") {
-			fullTx, err := s.getTransaction(tx.Signature)
-			if err != nil || fullTx == nil || fullTx.Meta.Err != nil {
-				continue
-			}
-			token := s.extractTokenFromTx(fullTx, tx.Signature, "pumpfun")
-			if token != nil {
-				s.seenMintsMu.Lock()
-				mintSeen := s.seenMints[token.TokenAddress]
-				if !mintSeen {
-					s.seenMints[token.TokenAddress] = true
-				}
-				s.seenMintsMu.Unlock()
-				if !mintSeen {
-					found++
-					log.Printf("ChainScannerAgent: 🚀 New token via Helius+RPC! Mint: %s\n", token.TokenAddress)
-					s.emitTokenFound(*token)
-				}
-			}
-			continue
-		}
-
-		// Deduplicate by mint
-		s.seenMintsMu.Lock()
-		mintSeen := s.seenMints[mint]
-		if !mintSeen {
-			s.seenMints[mint] = true
-		}
-		s.seenMintsMu.Unlock()
-		if mintSeen {
-			continue
-		}
-
-		// Always fetch full tx to check for mayhem mode in logs
-		// This adds 1 RPC call per token but ensures we never buy mayhem tokens
-		fullTx, err := s.getTransaction(tx.Signature)
-		if err == nil && fullTx != nil && fullTx.Meta.Err == nil {
-			if isMayhemFromLogs(fullTx.Meta.LogMessages) {
-				log.Printf("ChainScannerAgent: Skipping mayhem mode token: %s\n", mint)
-				continue
-			}
-		}
-
-		token := &models.TokenFound{
-			Chain:          models.ChainSolana,
-			TokenAddress:   mint,
-			FirstSeenTS:    tx.Timestamp,
-			CreatorAddress: tx.FeePayer,
-			TxHash:         tx.Signature,
-			InitialLiquidity: models.InitialLiquidity{
-				Pair: "pumpfun",
-			},
-			Metadata: map[string]string{"source": "pumpfun"},
-		}
-
-		found++
-		log.Printf("ChainScannerAgent: 🚀 New token via Helius! Mint: %s creator: %s\n", mint, tx.FeePayer)
-		s.emitTokenFound(*token)
-	}
-	log.Printf("ChainScannerAgent: [helius/pumpfun] %d new tokens found\n", found)
-}
-
-// isMayhemFromLogs returns true if any log message indicates mayhem mode
-func isMayhemFromLogs(logs []string) bool {
-	for _, msg := range logs {
-		lower := strings.ToLower(msg)
-		if strings.Contains(lower, "mayhem") ||
-			strings.Contains(lower, "is_mayhem_mode: true") ||
-			strings.Contains(lower, "ismayhem") {
-			return true
-		}
-	}
-	return false
-}
-
-// scanProgram is the raw RPC fallback — fetches many sigs and looks for creates
-func (s *ChainScannerAgent) scanProgram(programID, source string, limit int) {
-	sigs, err := s.getRecentSignatures(programID, limit)
-	if err != nil {
-		log.Printf("ChainScannerAgent: Error fetching %s signatures: %v\n", source, err)
-		return
-	}
-
-	newCount, tokenCount := 0, 0
-	for _, sig := range sigs {
-		if sig.Err != nil {
-			continue
-		}
-
-		s.seenSigsMu.Lock()
-		seen := s.seenSigs[sig.Signature]
-		if !seen {
-			s.seenSigs[sig.Signature] = true
-			if len(s.seenSigs) > 10000 {
-				s.pruneSeen()
-			}
-		}
-		s.seenSigsMu.Unlock()
-		if seen {
-			continue
-		}
-		newCount++
-
-		tx, err := s.getTransaction(sig.Signature)
-		if err != nil {
-			log.Printf("ChainScannerAgent: Error fetching tx: %v\n", err)
-			continue
-		}
-		if tx == nil || tx.Meta.Err != nil {
-			continue
-		}
-
-		token := s.extractTokenFromTx(tx, sig.Signature, source)
-		if token != nil {
-			s.seenMintsMu.Lock()
-			mintSeen := s.seenMints[token.TokenAddress]
-			if !mintSeen {
-				s.seenMints[token.TokenAddress] = true
-			}
-			s.seenMintsMu.Unlock()
-			if !mintSeen {
-				tokenCount++
-				log.Printf("ChainScannerAgent: 🚀 New token via %s! Mint: %s\n", source, token.TokenAddress)
-				s.emitTokenFound(*token)
-			}
-		}
-	}
-	log.Printf("ChainScannerAgent: [%s] %d new txs, %d tokens found\n", source, newCount, tokenCount)
-}
-
-func (s *ChainScannerAgent) extractTokenFromTx(tx *txResult, txHash, source string) *models.TokenFound {
-	accounts := tx.Transaction.Message.AccountKeys
-	if len(accounts) == 0 {
-		return nil
-	}
-	logs := tx.Meta.LogMessages
-
-	if source == "pumpfun" {
-		// Only process create_v2 instructions — skip Sell/Buy/other
-		isCreate := false
-		isMayhem := false
-		for _, msg := range logs {
-			if strings.Contains(msg, "Instruction: Create") ||
-				strings.Contains(msg, "create_v2") ||
-				strings.Contains(msg, "CreateV2") {
-				isCreate = true
-			}
-			// Mayhem mode tokens log indicators in the create instruction
-			lowerMsg := strings.ToLower(msg)
-			if strings.Contains(lowerMsg, "mayhem") ||
-				strings.Contains(lowerMsg, "is_mayhem_mode: true") ||
-				strings.Contains(lowerMsg, "ismayhem") {
-				isMayhem = true
-			}
-		}
-		if !isCreate {
-			return nil
-		}
-		if isMayhem {
-			log.Printf("ChainScannerAgent: Skipping mayhem mode token (from logs): %s\n", txHash[:20])
-			return nil
-		}
-
-		// Find mint ending in "pump" in post token balances
-		mint := ""
-		for _, bal := range tx.Meta.PostTokenBalances {
-			if strings.HasSuffix(bal.Mint, "pump") {
-				mint = bal.Mint
-				break
-			}
-		}
-		// Fallback: scan account keys
-		if mint == "" {
-			for _, acc := range accounts {
-				if strings.HasSuffix(acc, "pump") {
-					mint = acc
-					break
-				}
-			}
-		}
-		if mint == "" {
-			return nil
-		}
-
-		var reserveToken float64
-		for _, bal := range tx.Meta.PostTokenBalances {
-			if bal.Mint == mint {
-				reserveToken = bal.UITokenAmount.UIAmount
-				break
-			}
-		}
-		reserveNative := s.estimateSOLReserve(logs)
-		return s.buildToken(mint, accounts[0], reserveToken, reserveNative, txHash, source, tx.BlockTime)
-	}
-
-	if source == "pumpswap" {
-		isPoolCreate := false
-		for _, msg := range logs {
-			if strings.Contains(msg, "create_pool") ||
-				strings.Contains(msg, "CreatePool") ||
-				strings.Contains(msg, "Initialize") {
-				isPoolCreate = true
-				break
-			}
-		}
-		if !isPoolCreate {
-			return nil
-		}
-		const WSOL = "So11111111111111111111111111111111111111112"
-		for _, bal := range tx.Meta.PostTokenBalances {
-			if bal.Mint != "" && bal.Mint != WSOL {
-				reserveNative := s.estimateSOLReserve(logs)
-				creator := ""
-				if len(accounts) > 0 {
-					creator = accounts[0]
-				}
-				return s.buildToken(bal.Mint, creator, bal.UITokenAmount.UIAmount, reserveNative, txHash, source, tx.BlockTime)
-			}
-		}
-	}
-	return nil
-}
-
-func (s *ChainScannerAgent) buildToken(mint, creator string, reserveToken, reserveNative float64, txHash, source string, blockTime *int64) *models.TokenFound {
-	if reserveNative > 0 {
-		liquidityUSD := reserveNative * 150.0
-		if liquidityUSD < s.config.MinLiquidity {
-			log.Printf("ChainScannerAgent: Skipping %s - liquidity $%.2f < min $%.2f\n", mint, liquidityUSD, s.config.MinLiquidity)
-			return nil
-		}
-	}
-	ts := time.Now().Unix()
-	if blockTime != nil {
-		ts = *blockTime
-	}
-	return &models.TokenFound{
-		Chain:          models.ChainSolana,
-		TokenAddress:   mint,
-		FirstSeenTS:    ts,
-		CreatorAddress: creator,
-		TxHash:         txHash,
-		InitialLiquidity: models.InitialLiquidity{
-			Pair:          source,
-			ReserveToken:  reserveToken,
-			ReserveNative: reserveNative,
-		},
-		Metadata: map[string]string{"source": source},
-	}
-}
-
-func (s *ChainScannerAgent) estimateSOLReserve(logs []string) float64 {
-	for _, msg := range logs {
-		var amount float64
-		if n, _ := fmt.Sscanf(msg, "Program log: sol_amount: %f", &amount); n == 1 {
-			return amount / 1e9
-		}
-		if n, _ := fmt.Sscanf(msg, "Program log: virtual_sol_reserves: %f", &amount); n == 1 {
-			return amount / 1e9
-		}
-		if n, _ := fmt.Sscanf(msg, "Program log: real_sol_reserves: %f", &amount); n == 1 {
-			return amount / 1e9
-		}
-	}
-	return 0
 }
 
 func (s *ChainScannerAgent) pruneSeen() {
@@ -615,23 +439,8 @@ func (s *ChainScannerAgent) pruneSeen() {
 	for k := range s.seenSigs {
 		delete(s.seenSigs, k)
 		count++
-		if count >= 5000 {
+		if count >= 2500 {
 			break
 		}
-	}
-}
-
-func (s *ChainScannerAgent) scanBaseNewTokens() {
-	log.Println("ChainScannerAgent: Scanning Base for new tokens...")
-}
-
-func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
-	select {
-	case s.tokenChannel <- token:
-		log.Printf("ChainScannerAgent: Token emitted - %s\n", token.TokenAddress)
-	case <-s.ctx.Done():
-		return
-	default:
-		log.Println("ChainScannerAgent: Warning - token channel full, dropping event")
 	}
 }
