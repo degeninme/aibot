@@ -274,6 +274,9 @@ func (s *ChainScannerAgent) processKOLTransaction(sig, kolAddr, kolName string) 
 
 	// Check transaction logs for PumpFun + Buy + not Mayhem
 	hasPumpFun := false
+	hasPumpSwap := false
+	hasRaydium := false
+	hasJupiter := false
 	isBuy := false
 	isSell := false
 	isMayhem := false
@@ -281,6 +284,18 @@ func (s *ChainScannerAgent) processKOLTransaction(sig, kolAddr, kolName string) 
 	for _, msg := range tx.Meta.LogMessages {
 		if strings.Contains(msg, PumpFunProgram) {
 			hasPumpFun = true
+		}
+		// Detect other DEX activity for diagnostics
+		if strings.Contains(msg, "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA") {
+			hasPumpSwap = true
+		}
+		if strings.Contains(msg, "675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8") ||
+			strings.Contains(msg, "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK") {
+			hasRaydium = true
+		}
+		if strings.Contains(msg, "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4") ||
+			strings.Contains(msg, "JUP4Fb2cqiRUcaTHdrPC8h2gNsA2ETXiPDD33WcGuJB") {
+			hasJupiter = true
 		}
 		lower := strings.ToLower(msg)
 		if strings.Contains(lower, "instruction: buy") {
@@ -295,6 +310,32 @@ func (s *ChainScannerAgent) processKOLTransaction(sig, kolAddr, kolName string) 
 		}
 	}
 
+	// Diagnostic: log what this KOL is doing even if it's not a PumpFun buy
+	action := "unknown"
+	if isBuy {
+		action = "BUY"
+	} else if isSell {
+		action = "SELL"
+	}
+	venue := []string{}
+	if hasPumpFun {
+		venue = append(venue, "PumpFun")
+	}
+	if hasPumpSwap {
+		venue = append(venue, "PumpSwap")
+	}
+	if hasRaydium {
+		venue = append(venue, "Raydium")
+	}
+	if hasJupiter {
+		venue = append(venue, "Jupiter")
+	}
+	if len(venue) > 0 {
+		log.Printf("ChainScannerAgent: KOL_ACTIVITY %s %s on %s | sig=%s\n",
+			kolName, action, strings.Join(venue, "+"), sig[:16])
+	}
+
+	// Only proceed with PumpFun buys (not sells, not other DEXes, not mayhem)
 	if !hasPumpFun || isSell || !isBuy {
 		return
 	}
