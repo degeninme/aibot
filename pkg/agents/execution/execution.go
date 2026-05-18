@@ -790,6 +790,18 @@ func (e *ExecutionAgent) GetClosedTrades() []TradeOutcome {
 	return result
 }
 
+// GetCurrentExposureUSD returns the total USD value invested in currently open positions
+// (based on entry cost, not current value)
+func (e *ExecutionAgent) GetCurrentExposureUSD() float64 {
+	e.positionsMu.RLock()
+	defer e.positionsMu.RUnlock()
+	total := 0.0
+	for _, pos := range e.positions {
+		total += pos.SolSpent * 86.0
+	}
+	return total
+}
+
 // monitorPositionsLoop runs periodically to check positions for TP/SL/timeout
 func (e *ExecutionAgent) monitorPositionsLoop() {
 	if e.privateKey == nil {
