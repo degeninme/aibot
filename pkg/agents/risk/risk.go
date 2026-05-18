@@ -136,6 +136,19 @@ func (r *RiskManagerAgent) ReleaseExposure(amount float64) {
 		r.control.CurrentExposure)
 }
 
+// SyncExposure resets the current exposure based on actual open positions.
+// Useful after manual sells - call periodically to keep exposure accurate.
+func (r *RiskManagerAgent) SyncExposure(actualOpenPositions float64) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.control.CurrentExposure != actualOpenPositions {
+		log.Printf("RiskManager: Syncing exposure: %.2f -> %.2f (likely manual sells detected)\n",
+			r.control.CurrentExposure, actualOpenPositions)
+		r.control.CurrentExposure = actualOpenPositions
+	}
+}
+
+// haltTrading triggers the circuit breaker
 func (r *RiskManagerAgent) haltTrading() {
 	r.control.TradingHalted = true
 	log.Println("RiskManager: CIRCUIT BREAKER TRIGGERED - Trading halted!")
