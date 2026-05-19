@@ -195,8 +195,10 @@ func (s *StrategyEvaluatorAgent) determineAction(decision *models.StrategyDecisi
 }
 
 func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.StrategyDecision) float64 {
+	// Apply any runtime config overrides (e.g. dashboard DRY/LIVE toggle)
+	s.config.ApplyOverrides()
+
 	// In DRY_RUN mode, use a simulated $500 balance for realistic position sizing
-	// (otherwise low real wallet would block all paper trades)
 	balance := s.liveBalance()
 	if s.config.DryRun {
 		balance = 500.0 // simulated capital for paper trading
