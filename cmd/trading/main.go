@@ -49,6 +49,7 @@ func startAPIServer(cfg *config.Config) {
 	router.HandleFunc("/api/wallet", walletHandler).Methods("GET")
 	router.HandleFunc("/api/mode", modeHandler).Methods("GET")
 	router.HandleFunc("/api/mode", setModeHandler).Methods("POST")
+	router.HandleFunc("/api/risk/reset", resetExposureHandler).Methods("POST")
 	
 	// Serve frontend static files for all other routes
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./frontend")))
@@ -246,5 +247,16 @@ func setModeHandler(w http.ResponseWriter, r *http.Request) {
 		"mode":       mode,
 		"dry_run":    cfg.DryRun,
 		"overridden": config.IsDryRunOverridden(),
+	})
+}
+
+// resetExposureHandler manually clears stuck risk-manager exposure.
+// Useful when paper-trading or after manual sells when exposure gets stuck.
+func resetExposureHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	orch.GetRisk().ResetExposure()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":  "ok",
+		"message": "exposure cleared",
 	})
 }
