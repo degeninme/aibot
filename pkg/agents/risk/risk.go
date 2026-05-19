@@ -58,6 +58,9 @@ func (r *RiskManagerAgent) currentBalance() float64 {
 
 // CanExecute checks if a trade can be executed based on risk controls
 func (r *RiskManagerAgent) CanExecute(decision *models.StrategyDecision) (bool, string) {
+	// Apply any runtime config overrides (e.g. dashboard DRY/LIVE toggle)
+	r.config.ApplyOverrides()
+
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 
