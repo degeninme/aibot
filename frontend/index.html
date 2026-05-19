@@ -1,87 +1,993 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Meme Coin Trading Bot Dashboard</title>
-    <link rel="stylesheet" href="styles.css">
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>PUMP BOT // TERMINAL</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;500;700;800&family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+  :root {
+    --bg: #0a0a0a;
+    --panel: #111111;
+    --panel-2: #161616;
+    --border: #1f1f1f;
+    --border-bright: #2a2a2a;
+    --text: #e8e8e8;
+    --text-dim: #888;
+    --text-faint: #555;
+    --green: #4ade80;
+    --green-bg: #052e16;
+    --red: #f87171;
+    --red-bg: #2e0505;
+    --amber: #fbbf24;
+    --amber-bg: #2e1f05;
+    --blue: #60a5fa;
+    --purple: #a78bfa;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  html, body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 13px;
+    line-height: 1.4;
+    min-height: 100vh;
+  }
+
+  body {
+    background-image:
+      radial-gradient(ellipse at top, rgba(74, 222, 128, 0.04) 0%, transparent 50%),
+      radial-gradient(ellipse at bottom right, rgba(168, 139, 250, 0.03) 0%, transparent 50%);
+  }
+
+  /* Top header bar */
+  header {
+    border-bottom: 1px solid var(--border-bright);
+    padding: 12px 20px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--panel);
+    position: sticky;
+    top: 0;
+    z-index: 100;
+    backdrop-filter: blur(8px);
+  }
+
+  .logo {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    font-weight: 800;
+    font-size: 15px;
+    letter-spacing: 0.05em;
+  }
+
+  .logo::before {
+    content: '';
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    background: var(--green);
+    border-radius: 50%;
+    box-shadow: 0 0 10px var(--green);
+    animation: pulse 2s infinite;
+  }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0.4; }
+  }
+
+  .header-meta {
+    display: flex;
+    gap: 24px;
+    align-items: center;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .header-meta strong {
+    color: var(--text);
+    font-weight: 500;
+  }
+
+  .mode-badge {
+    padding: 3px 8px;
+    border-radius: 2px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+  }
+
+  .mode-badge.dry { background: var(--amber-bg); color: var(--amber); border: 1px solid var(--amber); }
+  .mode-badge.live { background: var(--red-bg); color: var(--red); border: 1px solid var(--red); }
+
+  /* Mode toggle */
+  .mode-toggle {
+    display: inline-flex;
+    border: 1px solid var(--border-bright);
+    border-radius: 3px;
+    overflow: hidden;
+  }
+  .mode-btn {
+    padding: 4px 12px;
+    background: transparent;
+    border: none;
+    color: var(--text-faint);
+    font-family: inherit;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    cursor: pointer;
+    transition: all 0.15s;
+  }
+  .mode-btn:hover:not(.active) {
+    color: var(--text-dim);
+    background: var(--panel-2);
+  }
+  .mode-btn.active[data-mode="dry"] {
+    background: var(--amber-bg);
+    color: var(--amber);
+  }
+  .mode-btn.active[data-mode="live"] {
+    background: var(--red-bg);
+    color: var(--red);
+  }
+  .mode-btn:disabled {
+    cursor: wait;
+    opacity: 0.5;
+  }
+
+  /* Main layout */
+  main {
+    display: grid;
+    grid-template-columns: 320px 1fr;
+    gap: 1px;
+    background: var(--border-bright);
+    min-height: calc(100vh - 50px);
+  }
+
+  .sidebar, .content {
+    background: var(--bg);
+    padding: 20px;
+  }
+
+  .content {
+    display: grid;
+    gap: 20px;
+    grid-template-rows: auto 1fr;
+  }
+
+  /* Panels */
+  .panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    overflow: hidden;
+  }
+
+  .panel-header {
+    padding: 10px 14px;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    background: var(--panel-2);
+  }
+
+  .panel-title {
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.15em;
+    color: var(--text-dim);
+    text-transform: uppercase;
+  }
+
+  .panel-meta {
+    font-size: 10px;
+    color: var(--text-faint);
+  }
+
+  .panel-body {
+    padding: 14px;
+  }
+
+  /* Stat blocks */
+  .stat {
+    display: flex;
+    justify-content: space-between;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+  }
+
+  .stat:last-child { border-bottom: none; }
+
+  .stat-label {
+    color: var(--text-dim);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+  }
+
+  .stat-value {
+    font-weight: 500;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .stat-value.green { color: var(--green); }
+  .stat-value.red { color: var(--red); }
+  .stat-value.amber { color: var(--amber); }
+  .stat-value.dim { color: var(--text-dim); }
+
+  /* Big metric block */
+  .big-metric {
+    padding: 18px 14px;
+    text-align: left;
+  }
+
+  .big-metric-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.15em;
+    margin-bottom: 6px;
+  }
+
+  .big-metric-value {
+    font-size: 28px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    letter-spacing: -0.02em;
+  }
+
+  .big-metric-sub {
+    font-size: 11px;
+    color: var(--text-dim);
+    margin-top: 4px;
+  }
+
+  /* Metrics grid */
+  .metrics-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 1px;
+    background: var(--border-bright);
+  }
+
+  .metrics-grid > .panel { border-radius: 0; }
+
+  /* Tables */
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 12px;
+  }
+
+  table th, table td {
+    padding: 8px 14px;
+    text-align: left;
+    border-bottom: 1px solid var(--border);
+    font-variant-numeric: tabular-nums;
+  }
+
+  table th {
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    background: var(--panel-2);
+    position: sticky;
+    top: 0;
+  }
+
+  table tr:hover {
+    background: var(--panel-2);
+  }
+
+  .mono { font-family: 'JetBrains Mono', monospace; }
+  .truncate {
+    max-width: 110px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    display: inline-block;
+    vertical-align: middle;
+  }
+
+  /* Pills */
+  .pill {
+    display: inline-block;
+    padding: 2px 7px;
+    border-radius: 2px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+  }
+
+  .pill.tp1 { background: var(--green-bg); color: var(--green); }
+  .pill.tp2 { background: var(--green-bg); color: var(--green); }
+  .pill.timeout { background: var(--amber-bg); color: var(--amber); }
+  .pill.stop_loss { background: var(--red-bg); color: var(--red); }
+  .pill.phantom { background: #1e1e1e; color: var(--text-faint); border: 1px solid var(--border-bright); }
+  .pill.trailing_stop { background: var(--green-bg); color: var(--green); }
+
+  /* Scroll area */
+  .scroll {
+    max-height: 480px;
+    overflow-y: auto;
+  }
+
+  .scroll::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  .scroll::-webkit-scrollbar-track { background: var(--bg); }
+  .scroll::-webkit-scrollbar-thumb {
+    background: var(--border-bright);
+    border-radius: 3px;
+  }
+
+  /* Empty state */
+  .empty {
+    padding: 60px 20px;
+    text-align: center;
+    color: var(--text-faint);
+    font-size: 12px;
+  }
+
+  .empty::before {
+    content: '⊘';
+    display: block;
+    font-size: 24px;
+    margin-bottom: 8px;
+    color: var(--text-faint);
+  }
+
+  /* Refresh indicator */
+  .refresh-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--green);
+    margin-left: 8px;
+    transition: opacity 0.5s;
+  }
+
+  .refresh-dot.flash {
+    opacity: 1;
+    box-shadow: 0 0 8px var(--green);
+  }
+
+  /* Connection status */
+  .conn {
+    font-size: 10px;
+    color: var(--text-dim);
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .conn-dot {
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--red);
+  }
+
+  .conn-dot.ok { background: var(--green); }
+
+  /* Filter tabs */
+  .tabs {
+    display: flex;
+    gap: 4px;
+    margin-bottom: 12px;
+  }
+
+  .tab {
+    padding: 5px 12px;
+    border: 1px solid var(--border-bright);
+    background: var(--panel);
+    color: var(--text-dim);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    cursor: pointer;
+    border-radius: 2px;
+  }
+
+  .tab.active {
+    background: var(--text);
+    color: var(--bg);
+    border-color: var(--text);
+  }
+
+  .tab:hover:not(.active) {
+    border-color: var(--text-dim);
+    color: var(--text);
+  }
+
+  /* Responsive */
+  @media (max-width: 980px) {
+    main { grid-template-columns: 1fr; }
+    .metrics-grid { grid-template-columns: repeat(2, 1fr); }
+  }
+
+  /* Subtle bottom border for last row */
+  table tr:last-child td { border-bottom: none; }
+
+  /* Header divider */
+  .h-sep {
+    width: 1px;
+    height: 16px;
+    background: var(--border-bright);
+  }
+
+  /* Action button */
+  .btn {
+    padding: 6px 12px;
+    background: transparent;
+    border: 1px solid var(--border-bright);
+    color: var(--text);
+    font-family: inherit;
+    font-size: 11px;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: all 0.15s;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+
+  .btn:hover {
+    border-color: var(--text);
+    background: var(--panel-2);
+  }
+
+  /* PnL ribbon */
+  .pnl-ribbon {
+    grid-column: 1 / -1;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 20px 24px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 30px;
+  }
+
+  .pnl-main {
+    display: flex;
+    flex-direction: column;
+  }
+
+  .pnl-amount {
+    font-size: 32px;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pnl-stats {
+    display: flex;
+    gap: 30px;
+  }
+
+  .pnl-stat {
+    text-align: right;
+  }
+
+  .pnl-stat-value {
+    font-size: 18px;
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+
+  .pnl-stat-label {
+    font-size: 10px;
+    color: var(--text-dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-top: 2px;
+  }
+</style>
 </head>
 <body>
-    <div class="container">
-        <header>
-            <h1>🚀 Meme Coin Trading Bot</h1>
-            <div class="header-status">
-                <span id="connection-status" class="status-badge disconnected">Disconnected</span>
-                <span id="last-update">Last update: Never</span>
-            </div>
-        </header>
 
-        <!-- Status Overview -->
-        <section class="card">
-            <h2>📊 Status Overview</h2>
-            <div class="status-grid">
-                <div class="status-item">
-                    <div class="status-label">System Status</div>
-                    <div id="system-status" class="status-value">-</div>
-                </div>
-                <div class="status-item">
-                    <div class="status-label">Trading Status</div>
-                    <div id="trading-status" class="status-value">-</div>
-                </div>
-                <div class="status-item">
-                    <div class="status-label">Candidates</div>
-                    <div id="candidate-count" class="status-value">0</div>
-                </div>
-                <div class="status-item">
-                    <div class="status-label">Tokens Found</div>
-                    <div id="tokens-found" class="status-value">0</div>
-                </div>
-            </div>
-        </section>
+<header>
+  <div class="logo">PUMP_BOT // TERMINAL</div>
+  <div class="header-meta">
+    <span class="conn" id="conn-status">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span id="conn-text">CONNECTING…</span>
+    </span>
+    <div class="h-sep"></div>
+    <div class="mode-toggle" id="mode-toggle">
+      <button class="mode-btn" data-mode="dry" id="btn-dry">DRY</button>
+      <button class="mode-btn" data-mode="live" id="btn-live">LIVE</button>
+    </div>
+    <div class="h-sep"></div>
+    <span>UPTIME <strong id="uptime">—</strong></span>
+    <div class="h-sep"></div>
+    <span>SOL ≈ $86</span>
+    <div class="h-sep"></div>
+    <span>LAST UPDATE <strong id="last-update">—</strong><span class="refresh-dot" id="refresh-dot"></span></span>
+  </div>
+</header>
 
-        <!-- Metrics -->
-        <section class="card">
-            <h2>📈 Metrics</h2>
-            <div class="metrics-grid">
-                <div class="metric-item">
-                    <div class="metric-label">Tokens Found</div>
-                    <div id="metric-tokens-found" class="metric-value">0</div>
-                </div>
-                <div class="metric-item">
-                    <div class="metric-label">Tokens Filtered</div>
-                    <div id="metric-tokens-filtered" class="metric-value">0</div>
-                </div>
-                <div class="metric-item">
-                    <div class="metric-label">Candidates Listed</div>
-                    <div id="metric-candidates" class="metric-value">0</div>
-                </div>
-                <div class="metric-item">
-                    <div class="metric-label">Trades Executed</div>
-                    <div id="metric-executions" class="metric-value">0</div>
-                </div>
-            </div>
-        </section>
+<main>
 
-        <!-- Risk Management -->
-        <section class="card">
-            <h2>⚠️ Risk Management</h2>
-            <div id="risk-content">
-                <div class="risk-info">Loading risk data...</div>
-            </div>
-        </section>
-
-        <!-- Token Candidates -->
-        <section class="card">
-            <h2>🎯 Token Candidates</h2>
-            <div class="candidates-header">
-                <button id="refresh-candidates" class="btn btn-primary">Refresh Candidates</button>
-            </div>
-            <div id="candidates-list" class="candidates-list">
-                <div class="loading">Loading candidates...</div>
-            </div>
-        </section>
+  <!-- LEFT SIDEBAR -->
+  <aside class="sidebar">
+    <div class="panel" style="margin-bottom: 16px;">
+      <div class="big-metric">
+        <div class="big-metric-label">Wallet Balance</div>
+        <div class="big-metric-value" id="wallet-balance">—</div>
+        <div class="big-metric-sub" id="wallet-sub">— SOL</div>
+      </div>
     </div>
 
-    <script src="app.js"></script>
+    <div class="panel" style="margin-bottom: 16px;">
+      <div class="panel-header">
+        <span class="panel-title">Risk Status</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Exposure</span>
+        <span class="stat-value" id="risk-exposure">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Daily Loss</span>
+        <span class="stat-value" id="risk-loss">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Single Pos %</span>
+        <span class="stat-value dim" id="risk-single-pct">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Total Exp %</span>
+        <span class="stat-value dim" id="risk-total-pct">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Status</span>
+        <span class="stat-value" id="risk-status-text">—</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Pipeline</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Scanned</span>
+        <span class="stat-value" id="m-scanned">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Filtered</span>
+        <span class="stat-value" id="m-filtered">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Safe</span>
+        <span class="stat-value" id="m-safe">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Candidates</span>
+        <span class="stat-value" id="m-candidates">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Executed</span>
+        <span class="stat-value green" id="m-executed">—</span>
+      </div>
+      <div class="stat">
+        <span class="stat-label">Failed</span>
+        <span class="stat-value red" id="m-failed">—</span>
+      </div>
+    </div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <section class="content">
+
+    <!-- TOP STRIP: Trade Stats -->
+    <div class="metrics-grid">
+      <div class="panel">
+        <div class="big-metric">
+          <div class="big-metric-label">Net P&L</div>
+          <div class="big-metric-value" id="pnl-total">—</div>
+          <div class="big-metric-sub" id="pnl-total-usd">— USD</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="big-metric">
+          <div class="big-metric-label">Closed Trades</div>
+          <div class="big-metric-value" id="trades-count">—</div>
+          <div class="big-metric-sub" id="trades-sub">— wins / — losses</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="big-metric">
+          <div class="big-metric-label">Win Rate</div>
+          <div class="big-metric-value" id="win-rate">—</div>
+          <div class="big-metric-sub" id="win-rate-sub">— avg peak mult</div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="big-metric">
+          <div class="big-metric-label">Best Trade</div>
+          <div class="big-metric-value green" id="best-trade">—</div>
+          <div class="big-metric-sub" id="worst-trade">worst —</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- BOTTOM: Closed Trades Table -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Closed Trades <span class="panel-meta" id="trades-meta"></span></span>
+        <div class="tabs">
+          <span class="tab active" data-filter="all">ALL</span>
+          <span class="tab" data-filter="tp1">TP1</span>
+          <span class="tab" data-filter="tp2">TP2</span>
+          <span class="tab" data-filter="trailing_stop">TRAIL</span>
+          <span class="tab" data-filter="stop_loss">STOP</span>
+          <span class="tab" data-filter="timeout">TIME</span>
+          <span class="tab" data-filter="phantom">PHANT</span>
+        </div>
+      </div>
+      <div class="scroll" id="trades-scroll">
+        <table id="trades-table">
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Mint</th>
+              <th>Reason</th>
+              <th style="text-align:right">In</th>
+              <th style="text-align:right">Out</th>
+              <th style="text-align:right">P&L</th>
+              <th style="text-align:right">P&L %</th>
+              <th style="text-align:right">Peak</th>
+              <th style="text-align:right">Duration</th>
+              <th>TX</th>
+            </tr>
+          </thead>
+          <tbody id="trades-tbody">
+            <tr><td colspan="10"><div class="empty">No closed trades yet. Bot is collecting data…</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- Open Candidates -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">Recent Candidates <span class="panel-meta" id="cands-meta"></span></span>
+      </div>
+      <div class="scroll" style="max-height: 300px;">
+        <table>
+          <thead>
+            <tr>
+              <th>Time</th>
+              <th>Mint</th>
+              <th>Action</th>
+              <th>Confidence</th>
+              <th style="text-align:right">Win Prob</th>
+              <th style="text-align:right">Size USD</th>
+              <th>Status</th>
+            </tr>
+          </thead>
+          <tbody id="cands-tbody">
+            <tr><td colspan="7"><div class="empty">No candidates yet</div></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script>
+  const startTime = Date.now();
+  let currentFilter = 'all';
+
+  const fmtSol = n => n == null ? '—' : (Math.abs(n) < 0.001 ? n.toFixed(6) : n.toFixed(4));
+  const fmtUSD = n => n == null ? '—' : ('$' + (Math.abs(n) >= 1000 ? n.toFixed(0) : n.toFixed(2)));
+  const fmtPct = n => n == null ? '—' : ((n >= 0 ? '+' : '') + n.toFixed(1) + '%');
+  const fmtTime = ms => {
+    const s = Math.floor(ms / 1000);
+    if (s < 60) return s + 's';
+    if (s < 3600) return Math.floor(s/60) + 'm ' + (s%60) + 's';
+    return Math.floor(s/3600) + 'h ' + Math.floor((s%3600)/60) + 'm';
+  };
+  const ago = ts => {
+    const diff = Date.now() - new Date(ts).getTime();
+    if (diff < 60_000) return Math.floor(diff/1000) + 's ago';
+    if (diff < 3_600_000) return Math.floor(diff/60000) + 'm ago';
+    if (diff < 86_400_000) return Math.floor(diff/3_600_000) + 'h ago';
+    return Math.floor(diff/86_400_000) + 'd ago';
+  };
+  const trunc = (s, n=8) => s ? s.slice(0, n) + '…' + s.slice(-3) : '—';
+
+  let allTrades = [];
+  let allCandidates = [];
+
+  async function fetchJSON(url) {
+    const res = await fetch(url, { cache: 'no-store' });
+    if (!res.ok) throw new Error(url + ' ' + res.status);
+    return res.json();
+  }
+
+  function setConnected(ok) {
+    const dot = document.getElementById('conn-dot');
+    const txt = document.getElementById('conn-text');
+    if (ok) {
+      dot.classList.add('ok');
+      txt.textContent = 'CONNECTED';
+    } else {
+      dot.classList.remove('ok');
+      txt.textContent = 'DISCONNECTED';
+    }
+  }
+
+  function flashRefresh() {
+    const dot = document.getElementById('refresh-dot');
+    dot.classList.add('flash');
+    setTimeout(() => dot.classList.remove('flash'), 600);
+  }
+
+  async function poll() {
+    try {
+      const [status, risk, trades, cands, wallet, mode] = await Promise.all([
+        fetchJSON('/api/status').catch(() => null),
+        fetchJSON('/api/risk').catch(() => null),
+        fetchJSON('/api/trades').catch(() => null),
+        fetchJSON('/api/candidates').catch(() => null),
+        fetchJSON('/api/wallet').catch(() => null),
+        fetchJSON('/api/mode').catch(() => null),
+      ]);
+
+      setConnected(!!status);
+      flashRefresh();
+      document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+      document.getElementById('uptime').textContent = fmtTime(Date.now() - startTime);
+
+      // Mode
+      if (mode) {
+        updateModeUI(mode.dry_run);
+      }
+
+      // Wallet balance
+      if (wallet) {
+        document.getElementById('wallet-balance').textContent = fmtUSD(wallet.usd || 0);
+        document.getElementById('wallet-sub').textContent = fmtSol(wallet.sol || 0) + ' SOL';
+      }
+
+      // Metrics
+      if (status?.metrics) {
+        document.getElementById('m-scanned').textContent = (status.metrics.tokens_found ?? 0).toLocaleString();
+        document.getElementById('m-filtered').textContent = (status.metrics.tokens_filtered ?? 0).toLocaleString();
+        document.getElementById('m-safe').textContent = '—';
+        document.getElementById('m-candidates').textContent = (status.metrics.candidates ?? 0).toLocaleString();
+        document.getElementById('m-executed').textContent = (status.metrics.executions ?? 0).toLocaleString();
+        document.getElementById('m-failed').textContent = '—';
+      }
+
+      // Risk
+      if (risk) {
+        document.getElementById('risk-exposure').textContent = fmtUSD(risk.current_exposure ?? 0);
+        document.getElementById('risk-loss').textContent = fmtUSD(risk.daily_loss ?? 0);
+        document.getElementById('risk-single-pct').textContent = ((risk.single_position_pct ?? 0) * 100).toFixed(0) + '%';
+        document.getElementById('risk-total-pct').textContent = ((risk.total_exposure_pct ?? 0) * 100).toFixed(0) + '%';
+        const halted = risk.trading_halted;
+        const statusEl = document.getElementById('risk-status-text');
+        statusEl.textContent = halted ? 'HALTED' : 'ACTIVE';
+        statusEl.className = 'stat-value ' + (halted ? 'red' : 'green');
+      }
+
+      // Trades
+      if (trades?.trades) {
+        allTrades = trades.trades;
+        renderTrades();
+        renderSummary();
+      }
+
+      // Candidates
+      if (cands?.candidates) {
+        allCandidates = cands.candidates;
+        renderCandidates();
+      }
+
+    } catch (e) {
+      console.error(e);
+      setConnected(false);
+    }
+  }
+
+  function renderSummary() {
+    const trades = allTrades;
+
+    if (trades.length === 0) {
+      document.getElementById('pnl-total').textContent = '—';
+      document.getElementById('trades-count').textContent = '0';
+      document.getElementById('win-rate').textContent = '—';
+      document.getElementById('best-trade').textContent = '—';
+      return;
+    }
+
+    let totalIn = 0, totalOut = 0, wins = 0, losses = 0, peakSum = 0;
+    let bestPnl = -Infinity, worstPnl = Infinity;
+    trades.forEach(t => {
+      totalIn += t.sol_in || 0;
+      totalOut += t.sol_out || 0;
+      peakSum += t.peak_multiplier || 1;
+      if ((t.pnl_sol || 0) > 0) wins++;
+      else if ((t.pnl_sol || 0) < 0) losses++;
+      if ((t.pnl_sol || 0) > bestPnl) bestPnl = t.pnl_sol;
+      if ((t.pnl_sol || 0) < worstPnl) worstPnl = t.pnl_sol;
+    });
+
+    const netSol = totalOut - totalIn;
+    const netUSD = netSol * 86;
+    const pnlEl = document.getElementById('pnl-total');
+    pnlEl.textContent = (netSol >= 0 ? '+' : '') + fmtSol(netSol) + ' SOL';
+    pnlEl.style.color = netSol >= 0 ? 'var(--green)' : 'var(--red)';
+    document.getElementById('pnl-total-usd').textContent = fmtUSD(netUSD);
+
+    document.getElementById('trades-count').textContent = trades.length;
+    document.getElementById('trades-sub').textContent = wins + ' wins / ' + losses + ' losses';
+
+    const winRate = trades.length ? (wins / trades.length * 100) : 0;
+    document.getElementById('win-rate').textContent = winRate.toFixed(0) + '%';
+    document.getElementById('win-rate-sub').textContent = (peakSum / trades.length).toFixed(2) + 'x avg peak';
+
+    const bestEl = document.getElementById('best-trade');
+    bestEl.textContent = (bestPnl >= 0 ? '+' : '') + fmtSol(bestPnl);
+    bestEl.style.color = bestPnl > 0 ? 'var(--green)' : 'var(--red)';
+    document.getElementById('worst-trade').textContent = 'worst ' + fmtSol(worstPnl);
+  }
+
+  function renderTrades() {
+    const tbody = document.getElementById('trades-tbody');
+    let filtered = allTrades;
+    if (currentFilter !== 'all') {
+      filtered = filtered.filter(t => t.exit_reason === currentFilter);
+    }
+    filtered = filtered.slice().reverse().slice(0, 200);
+
+    document.getElementById('trades-meta').textContent = filtered.length + '/' + allTrades.length;
+
+    if (filtered.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="10"><div class="empty">No trades match filter</div></td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = filtered.map(t => {
+      const durationNs = t.duration || 0;
+      const durationSec = Math.floor(durationNs / 1e9);
+      const pnlClass = (t.pnl_sol || 0) > 0 ? 'green' : (t.pnl_sol || 0) < 0 ? 'red' : 'dim';
+      const peak = (t.peak_multiplier || 1).toFixed(2) + 'x';
+      const buyHash = t.buy_tx_hash || '';
+      const txDisplay = buyHash.startsWith('DRY_RUN') ?
+        '<span class="pill phantom">DRY</span>' :
+        (buyHash ? `<a href="https://solscan.io/tx/${buyHash}" target="_blank" style="color:var(--blue);text-decoration:none">${trunc(buyHash, 6)}</a>` : '—');
+
+      return `<tr>
+        <td>${ago(t.closed_at)}</td>
+        <td class="mono"><a href="https://pump.fun/coin/${t.mint}" target="_blank" style="color:var(--text);text-decoration:none">${trunc(t.mint, 6)}</a></td>
+        <td><span class="pill ${t.exit_reason}">${t.exit_reason.replace('_', ' ')}</span></td>
+        <td style="text-align:right">${fmtSol(t.sol_in)}</td>
+        <td style="text-align:right">${fmtSol(t.sol_out)}</td>
+        <td style="text-align:right" class="${pnlClass}">${(t.pnl_sol >= 0 ? '+' : '')}${fmtSol(t.pnl_sol)}</td>
+        <td style="text-align:right" class="${pnlClass}">${fmtPct(t.pnl_pct)}</td>
+        <td style="text-align:right">${peak}</td>
+        <td style="text-align:right">${durationSec}s</td>
+        <td>${txDisplay}</td>
+      </tr>`;
+    }).join('');
+  }
+
+  function renderCandidates() {
+    const tbody = document.getElementById('cands-tbody');
+    const recent = allCandidates.slice().reverse().slice(0, 50);
+
+    document.getElementById('cands-meta').textContent = allCandidates.length + ' total';
+
+    if (recent.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7"><div class="empty">No candidates yet</div></td></tr>';
+      return;
+    }
+
+    tbody.innerHTML = recent.map(c => {
+      const winProb = (c.strategy_decision?.win_probability || c.win_probability || 0);
+      const action = c.strategy_decision?.action || c.action || '—';
+      const conf = c.strategy_decision?.confidence || c.confidence || '—';
+      const sizeUSD = c.strategy_decision?.suggested_amount_usd || c.suggested_amount_usd || 0;
+      const mint = c.token_address || c.mint || '—';
+      const status = c.status || '—';
+
+      const actionColor = action === 'buy' ? 'var(--green)' : action === 'sell' ? 'var(--red)' : 'var(--text-dim)';
+
+      return `<tr>
+        <td>${c.evaluated_at ? ago(c.evaluated_at) : '—'}</td>
+        <td class="mono"><a href="https://pump.fun/coin/${mint}" target="_blank" style="color:var(--text);text-decoration:none">${trunc(mint, 6)}</a></td>
+        <td style="color:${actionColor};font-weight:600">${action.toUpperCase()}</td>
+        <td class="dim">${conf}</td>
+        <td style="text-align:right">${(winProb * 100).toFixed(0)}%</td>
+        <td style="text-align:right">${fmtUSD(sizeUSD)}</td>
+        <td><span class="pill ${status === 'executed' ? 'tp1' : status === 'rejected' ? 'phantom' : 'timeout'}">${status}</span></td>
+      </tr>`;
+    }).join('');
+  }
+
+  function updateModeUI(isDry) {
+    document.getElementById('btn-dry').classList.toggle('active', isDry);
+    document.getElementById('btn-live').classList.toggle('active', !isDry);
+  }
+
+  async function setMode(mode) {
+    const btnDry = document.getElementById('btn-dry');
+    const btnLive = document.getElementById('btn-live');
+    btnDry.disabled = true;
+    btnLive.disabled = true;
+
+    // For LIVE mode, confirm with the user since real money is at stake
+    if (mode === 'live') {
+      const confirmed = confirm(
+        '⚠️ SWITCH TO LIVE MODE?\n\n' +
+        'The bot will start trading with REAL SOL from your wallet.\n' +
+        'This action will use real money on every buy.\n\n' +
+        'Continue?'
+      );
+      if (!confirmed) {
+        btnDry.disabled = false;
+        btnLive.disabled = false;
+        return;
+      }
+    }
+
+    try {
+      const res = await fetch('/api/mode', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode })
+      });
+      const data = await res.json();
+      if (data.dry_run !== undefined) {
+        updateModeUI(data.dry_run);
+      }
+    } catch (e) {
+      console.error('Mode toggle failed', e);
+      alert('Failed to change mode: ' + e.message);
+    } finally {
+      btnDry.disabled = false;
+      btnLive.disabled = false;
+    }
+  }
+
+  document.getElementById('btn-dry').addEventListener('click', () => setMode('dry'));
+  document.getElementById('btn-live').addEventListener('click', () => setMode('live'));
+
+  // Filter tabs
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
+      tab.classList.add('active');
+      currentFilter = tab.dataset.filter;
+      renderTrades();
+    });
+  });
+
+  // Poll every 5 seconds
+  poll();
+  setInterval(poll, 5000);
+</script>
+
 </body>
 </html>
