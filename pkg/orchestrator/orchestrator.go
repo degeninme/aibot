@@ -278,3 +278,8 @@ func (o *Orchestrator) GetRisk() *risk.RiskManagerAgent {
 func (o *Orchestrator) GetExecution() *execution.ExecutionAgent {
 	return o.execution
 }
+
+// GetConfig returns the active configuration
+func (o *Orchestrator) GetConfig() *config.Config {
+	return o.config
+}
