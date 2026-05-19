@@ -992,6 +992,9 @@ func (e *ExecutionAgent) estimateCurrentSolValue(mint string, originalSol, curre
 // ─── Public interface ─────────────────────────────────────────────────────────
 
 func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.CandidateToken) (*models.ExecutionResult, error) {
+	// Apply any runtime overrides (e.g. dashboard toggle) before reading flags
+	e.config.ApplyOverrides()
+
 	log.Printf("ExecutionAgent: Executing trade for %s\n", candidate.Token.TokenAddress)
 
 	result := &models.ExecutionResult{
