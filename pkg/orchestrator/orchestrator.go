@@ -53,8 +53,10 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 	strategyAgent.SetBalanceProvider(balanceProvider)
 
 	// Start a goroutine that keeps risk exposure in sync with actual open positions
+	// This handles cases where the user manually sold tokens, AND keeps DRY_RUN exposure
+	// from accumulating forever as paper positions close
 	go func() {
-		ticker := time.NewTicker(30 * time.Second)
+		ticker := time.NewTicker(10 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
 			actualExposure := exec.GetCurrentExposureUSD()
