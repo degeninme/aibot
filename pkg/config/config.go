@@ -1,6 +1,7 @@
 package config
 
 import (
+	"sync/atomic"
 	"time"
 
 	"github.com/joho/godotenv"
@@ -9,9 +10,29 @@ import (
 	"strings"
 )
 
+// dryRunOverride: -1 = use env var, 0 = force LIVE, 1 = force DRY
+var dryRunOverride int32 = -1
+
+// SetDryRunOverride changes dry-run mode at runtime. mode = "dry", "live", or "default" (env)
+func SetDryRunOverride(mode string) {
+	switch strings.ToLower(mode) {
+	case "dry", "true":
+		atomic.StoreInt32(&dryRunOverride, 1)
+	case "live", "false":
+		atomic.StoreInt32(&dryRunOverride, 0)
+	default:
+		atomic.StoreInt32(&dryRunOverride, -1)
+	}
+}
+
+// IsDryRunOverridden reports whether the runtime override is currently set.
+func IsDryRunOverridden() bool {
+	return atomic.LoadInt32(&dryRunOverride) != -1
+}
+
 // Config holds all application configuration
 type Config struct {
-	// General settings
+	// General settings — DryRun is accessed via the IsDryRun() method to support runtime override
 	DryRun              bool
 	AutoExecute         bool
 	
@@ -69,6 +90,18 @@ type Config struct {
 	BlacklistedTokens   []string
 	BlacklistedCreators []string
 	WhitelistedTokens   []string
+}
+
+// ApplyOverrides syncs runtime overrides (e.g. from dashboard toggle) into the config struct.
+// Should be called before reading config flags that support runtime override (currently: DryRun).
+func (c *Config) ApplyOverrides() {
+	override := atomic.LoadInt32(&dryRunOverride)
+	switch override {
+	case 1:
+		c.DryRun = true
+	case 0:
+		c.DryRun = false
+	}
 }
 
 // LoadConfig loads configuration from environment variables
