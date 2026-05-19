@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -45,6 +46,9 @@ func startAPIServer(cfg *config.Config) {
 	router.HandleFunc("/api/risk", riskHandler).Methods("GET")
 	router.HandleFunc("/api/risk/resume", resumeTradingHandler).Methods("POST")
 	router.HandleFunc("/api/trades", tradesHandler).Methods("GET")
+	router.HandleFunc("/api/wallet", walletHandler).Methods("GET")
+	router.HandleFunc("/api/mode", modeHandler).Methods("GET")
+	router.HandleFunc("/api/mode", setModeHandler).Methods("POST")
 	
 	// Serve frontend static files for all other routes
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./frontend")))
@@ -180,5 +184,67 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"count":  len(trades),
 		"trades": trades,
+	})
+}
+
+// Wallet endpoint - returns current SOL & USD balance
+func walletHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	execAgent := orch.GetExecution()
+	solBal := execAgent.GetWalletBalanceSOL()
+	usdBal := execAgent.GetWalletBalanceUSD()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"sol":      solBal,
+		"usd":      usdBal,
+		"exposure": execAgent.GetCurrentExposureUSD(),
+	})
+}
+
+// modeHandler returns the current DRY_RUN state
+func modeHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	cfg := orch.GetConfig()
+	cfg.ApplyOverrides()
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"dry_run":    cfg.DryRun,
+		"overridden": config.IsDryRunOverridden(),
+	})
+}
+
+// setModeHandler updates DRY_RUN at runtime. Body: {"mode": "dry"|"live"|"default"}
+func setModeHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid body"})
+		return
+	}
+
+	mode := strings.ToLower(body.Mode)
+	if mode != "dry" && mode != "live" && mode != "default" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "mode must be dry, live, or default"})
+		return
+	}
+
+	config.SetDryRunOverride(mode)
+	cfg := orch.GetConfig()
+	cfg.ApplyOverrides()
+
+	log.Printf("MainAPI: Mode toggled to %s (DryRun=%v)\n", mode, cfg.DryRun)
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status":     "ok",
+		"mode":       mode,
+		"dry_run":    cfg.DryRun,
+		"overridden": config.IsDryRunOverridden(),
 	})
 }
