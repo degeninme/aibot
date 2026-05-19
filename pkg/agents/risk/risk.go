@@ -67,6 +67,11 @@ func (r *RiskManagerAgent) CanExecute(decision *models.StrategyDecision) (bool, 
 
 	balance := r.currentBalance()
 
+	// In DRY_RUN mode, use simulated $500 capital
+	if r.config.DryRun {
+		balance = 500.0
+	}
+
 	maxSinglePosition := balance * r.config.SinglePositionPct
 	if decision.SuggestedAmountUSD > maxSinglePosition {
 		log.Printf("RiskManager: Trade rejected - exceeds single position limit (%.2f > %.2f, balance=%.2f)\n",
