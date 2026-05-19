@@ -150,10 +150,19 @@ func (r *RiskManagerAgent) SyncExposure(actualOpenPositions float64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.control.CurrentExposure != actualOpenPositions {
-		log.Printf("RiskManager: Syncing exposure: %.2f -> %.2f (likely manual sells detected)\n",
+		log.Printf("RiskManager: Syncing exposure: %.2f -> %.2f\n",
 			r.control.CurrentExposure, actualOpenPositions)
 		r.control.CurrentExposure = actualOpenPositions
 	}
+}
+
+// ResetExposure forcibly zeroes the exposure counter — for manual reset via API
+func (r *RiskManagerAgent) ResetExposure() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	log.Printf("RiskManager: 🔄 Exposure FORCE RESET from %.2f to 0.00\n", r.control.CurrentExposure)
+	r.control.CurrentExposure = 0
+	r.control.TradingHalted = false
 }
 
 // haltTrading triggers the circuit breaker
