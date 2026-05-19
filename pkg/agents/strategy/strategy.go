@@ -195,11 +195,14 @@ func (s *StrategyEvaluatorAgent) determineAction(decision *models.StrategyDecisi
 }
 
 func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.StrategyDecision) float64 {
-	// Use floating live balance (USD) instead of static config
+	// In DRY_RUN mode, use a simulated $500 balance for realistic position sizing
+	// (otherwise low real wallet would block all paper trades)
 	balance := s.liveBalance()
+	if s.config.DryRun {
+		balance = 500.0 // simulated capital for paper trading
+	}
 
-	// Reserve some SOL for transaction fees & rent — equivalent to ~0.02 SOL at $86 = ~$1.72
-	// Keep $2 reserve to be safe
+	// Reserve some SOL for transaction fees & rent
 	const reserveUSD = 2.0
 
 	available := balance - reserveUSD
