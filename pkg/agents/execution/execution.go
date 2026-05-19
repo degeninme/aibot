@@ -904,17 +904,25 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 	log.Printf("ExecutionAgent: Position %s — multiplier=%.2fx peak=%.2fx age=%v\n",
 		mint[:10], mult, peakMult, age.Truncate(time.Second))
 
-	// ── TP1: 2x → sell 50% ────────────────────────────────────
-	if !tp1Done && mult >= 2.0 {
-		log.Printf("ExecutionAgent: TP1 hit (%.2fx) — selling 50%% of %s\n", mult, mint)
+	// Configurable TP/SL levels via env vars
+	tp1Mult := envFloat("TP1_MULTIPLIER", 2.0)
+	tp2Mult := envFloat("TP2_MULTIPLIER", 3.0)
+	tp1Pct := envInt("TP1_SELL_PCT", 50)
+	tp2Pct := envInt("TP2_SELL_PCT", 50)
+	stopLoss := envFloat("STOP_LOSS_MULT", 0.5) // sell when price drops below this multiplier
+	trailingDrop := envFloat("TRAILING_STOP_PCT", 0.7) // sell if mult <= peak * this
+
+	// ── TP1: configurable → sell TP1_SELL_PCT% ────────────────
+	if !tp1Done && mult >= tp1Mult {
+		log.Printf("ExecutionAgent: TP1 hit (%.2fx >= %.2fx) — selling %d%% of %s\n",
+			mult, tp1Mult, tp1Pct, mint)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, 50)
+		txHash, err := e.sellOnPumpFun(ctx, mint, tp1Pct)
 		if err != nil {
 			log.Printf("ExecutionAgent: TP1 sell failed: %v\n", err)
 		} else {
-			// Recovered ~50% of position at 2x = ~1.0x of original stake
-			estSol := pos.SolSpent * mult * 0.5
+			estSol := pos.SolSpent * mult * (float64(tp1Pct) / 100.0)
 			e.recordSellTx(mint, txHash, estSol)
 			e.positionsMu.Lock()
 			pos.TP1Done = true
@@ -924,17 +932,17 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		return
 	}
 
-	// ── TP2: 3x → sell 50% of remaining (=25% of original) ────
-	if tp1Done && !tp2Done && mult >= 3.0 {
-		log.Printf("ExecutionAgent: TP2 hit (%.2fx) — selling 50%% of remaining of %s\n", mult, mint)
+	// ── TP2: configurable ──────────────────────────────────────
+	if tp1Done && !tp2Done && mult >= tp2Mult {
+		log.Printf("ExecutionAgent: TP2 hit (%.2fx >= %.2fx) — selling %d%% of remaining of %s\n",
+			mult, tp2Mult, tp2Pct, mint)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, 50)
+		txHash, err := e.sellOnPumpFun(ctx, mint, tp2Pct)
 		if err != nil {
 			log.Printf("ExecutionAgent: TP2 sell failed: %v\n", err)
 		} else {
-			// Recovered ~25% of position at 3x = ~0.75x of original stake
-			estSol := pos.SolSpent * mult * 0.25
+			estSol := pos.SolSpent * mult * 0.25 // rough estimate of recovered SOL
 			e.recordSellTx(mint, txHash, estSol)
 			e.positionsMu.Lock()
 			pos.TP2Done = true
@@ -945,8 +953,7 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 	}
 
 	// ── Trailing stop on remaining 25% after TP2 ──────────────
-	// If price drops 30% from peak after TP2, sell remaining
-	if tp2Done && peakMult > 0 && mult <= peakMult*0.7 {
+	if tp2Done && peakMult > 0 && mult <= peakMult*trailingDrop {
 		log.Printf("ExecutionAgent: Trailing stop hit (peak=%.2fx now=%.2fx) — selling 100%% of %s\n",
 			peakMult, mult, mint)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -955,7 +962,6 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		if err != nil {
 			log.Printf("ExecutionAgent: Trailing stop sell failed: %v\n", err)
 		} else {
-			// Estimate SOL received from current price * tokens
 			estSol := e.estimateCurrentSolValue(mint, pos.SolSpent, mult)
 			e.recordSellTx(mint, txHash, estSol)
 			e.recordOutcome(mint, "trailing_stop")
@@ -964,9 +970,10 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 		return
 	}
 
-	// ── Hard stop loss: -50% (pre-TP1 only) ───────────────────
-	if !tp1Done && mult <= 0.5 {
-		log.Printf("ExecutionAgent: STOP LOSS hit (%.2fx) — selling 100%% of %s\n", mult, mint)
+	// ── Hard stop loss (pre-TP1 only) ─────────────────────────
+	if !tp1Done && mult <= stopLoss {
+		log.Printf("ExecutionAgent: STOP LOSS hit (%.2fx <= %.2fx) — selling 100%% of %s\n",
+			mult, stopLoss, mint)
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		txHash, err := e.sellOnPumpFun(ctx, mint, 100)
@@ -983,6 +990,33 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 
 	// (Timeout is now handled at the top of checkPosition, price-independent)
 }
+
+// envFloat reads a float env var with a default
+func envFloat(key string, def float64) float64 {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	var f float64
+	if _, err := fmt.Sscanf(v, "%f", &f); err == nil && f > 0 {
+		return f
+	}
+	return def
+}
+
+// envInt reads an int env var with a default
+func envInt(key string, def int) int {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	var n int
+	if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
+		return n
+	}
+	return def
+}
+
 
 // estimateCurrentSolValue estimates how much SOL the remaining position is worth
 func (e *ExecutionAgent) estimateCurrentSolValue(mint string, originalSol, currentMult float64) float64 {
