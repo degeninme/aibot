@@ -539,6 +539,7 @@
     <div class="panel" style="margin-bottom: 16px;">
       <div class="panel-header">
         <span class="panel-title">Risk Status</span>
+        <button class="btn" id="reset-exposure-btn" style="font-size: 9px; padding: 3px 8px;">RESET</button>
       </div>
       <div class="stat">
         <span class="stat-label">Exposure</span>
@@ -973,6 +974,19 @@
 
   document.getElementById('btn-dry').addEventListener('click', () => setMode('dry'));
   document.getElementById('btn-live').addEventListener('click', () => setMode('live'));
+
+  // Reset exposure button
+  document.getElementById('reset-exposure-btn').addEventListener('click', async () => {
+    if (!confirm('Reset exposure counter to $0?\n\nUse this if the risk manager is stuck at a high value preventing new trades.')) return;
+    try {
+      const res = await fetch('/api/risk/reset', { method: 'POST' });
+      const data = await res.json();
+      alert('Reset done: ' + (data.message || 'ok'));
+      poll();
+    } catch (e) {
+      alert('Reset failed: ' + e.message);
+    }
+  });
 
   // Filter tabs
   document.querySelectorAll('.tab').forEach(tab => {
