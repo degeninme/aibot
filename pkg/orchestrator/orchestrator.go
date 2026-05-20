@@ -2,8 +2,12 @@ package orchestrator
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/mumugogoing/meme_bot/pkg/agents/execution"
@@ -16,6 +20,7 @@ import (
 	"github.com/mumugogoing/meme_bot/pkg/agents/strategy"
 	"github.com/mumugogoing/meme_bot/pkg/agents/telemetry"
 	"github.com/mumugogoing/meme_bot/pkg/config"
+	"github.com/mumugogoing/meme_bot/pkg/intelligence"
 	"github.com/mumugogoing/meme_bot/pkg/llm"
 	"github.com/mumugogoing/meme_bot/pkg/models"
 )
@@ -35,6 +40,7 @@ type Orchestrator struct {
 	risk      *risk.RiskManagerAgent
 	telemetry *telemetry.TelemetryAgent
 	llm       *llm.Client
+	intel     *intelligence.Client
 	
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -68,6 +74,7 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 	}()
 
 	llmClient := llm.NewClient()
+	intelClient := intelligence.NewClient()
 
 	return &Orchestrator{
 		config:    cfg,
@@ -81,6 +88,7 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		risk:      riskMgr,
 		telemetry: telemetry.NewTelemetryAgent(),
 		llm:       llmClient,
+		intel:     intelClient,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -223,6 +231,59 @@ func (o *Orchestrator) executeCandidate(candidate *models.CandidateToken) {
 	// Check daily reset
 	o.risk.CheckDailyReset()
 
+	// ── LAYER 1: Developer Profiling ───────────────────────────────────────
+	// Skip if dev wallet is underfunded or a serial rugger.
+	if o.intel != nil && envBoolDefault("LAYER1_ENABLED", true) {
+		devAddr := candidate.Token.CreatorAddress
+		if devAddr == "" {
+			log.Printf("Orchestrator: ⚠️ No creator address for %s, skipping Layer 1\n",
+				candidate.Token.TokenAddress)
+		} else {
+			// Fetch dev SOL balance via RPC
+			devSol := o.fetchSolBalance(devAddr)
+			intelCtx, cancel := context.WithTimeout(o.ctx, 5*time.Second)
+			devAssessment := o.intel.AssessDeveloper(intelCtx, devAddr, devSol)
+			cancel()
+
+			log.Printf("Orchestrator: Layer 1 dev=%s sol=%.3f pnl=$%.0f winRate=%.0f%% trades=%d skip=%v reason=%s\n",
+				devAddr[:10], devAssessment.SolBalance, devAssessment.TotalPnL,
+				devAssessment.WinRate, devAssessment.TotalTrades,
+				devAssessment.Skip, devAssessment.Reason)
+
+			if devAssessment.Skip {
+				log.Printf("Orchestrator: ❌ LAYER 1 REJECTED %s — %s\n",
+					candidate.Token.TokenAddress, devAssessment.Reason)
+				o.listing.UpdateStatus(candidate.Token.TokenAddress, "layer1_rejected")
+				return
+			}
+		}
+	}
+
+	// ── LAYER 3: Metadata & Socials (also includes Layer 4 bonding progress) ──
+	// Skip if no social presence, high risk score, or wrong bonding curve stage.
+	if o.intel != nil && o.intel.Enabled() && envBoolDefault("LAYER3_ENABLED", true) {
+		intelCtx, cancel := context.WithTimeout(o.ctx, 5*time.Second)
+		tokenAssessment := o.intel.AssessToken(intelCtx, candidate.Token.TokenAddress)
+		cancel()
+
+		log.Printf("Orchestrator: Layer 3 token=%s tw=%v tg=%v web=%v risk=%.1f progress=%.1f%% liq=$%.0f mc=$%.0f skip=%v reason=%s\n",
+			candidate.Token.TokenAddress[:10],
+			tokenAssessment.HasTwitter, tokenAssessment.HasTelegram, tokenAssessment.HasWebsite,
+			tokenAssessment.RiskScore, tokenAssessment.BondingProgress,
+			tokenAssessment.LiquidityUSD, tokenAssessment.MarketCapUSD,
+			tokenAssessment.Skip, tokenAssessment.Reason)
+
+		if tokenAssessment.Skip {
+			log.Printf("Orchestrator: ❌ LAYER 3 REJECTED %s — %s\n",
+				candidate.Token.TokenAddress, tokenAssessment.Reason)
+			o.listing.UpdateStatus(candidate.Token.TokenAddress, "layer3_rejected")
+			return
+		}
+
+		log.Printf("Orchestrator: ✓ LAYERS 1+3 PASSED for %s — proceeding to execution\n",
+			candidate.Token.TokenAddress)
+	}
+
 	// ── TIER 1 LLM FILTER (non-blocking, 2s timeout) ───────────────────────
 	// Runs in parallel with risk checks. If LLM says "don't buy", skip.
 	// If LLM doesn't respond within 2s OR is disabled, proceed without it.
@@ -348,4 +409,50 @@ func (o *Orchestrator) GetConfig() *config.Config {
 // GetLLM returns the LLM client
 func (o *Orchestrator) GetLLM() *llm.Client {
 	return o.llm
+}
+
+// fetchSolBalance queries the RPC for a wallet's SOL balance
+// Returns 0 on error (caller decides whether to fail open or skip)
+func (o *Orchestrator) fetchSolBalance(address string) float64 {
+	ctx, cancel := context.WithTimeout(o.ctx, 3*time.Second)
+	defer cancel()
+
+	bodyStr := fmt.Sprintf(`{"jsonrpc":"2.0","id":1,"method":"getBalance","params":["%s"]}`, address)
+	req, err := http.NewRequestWithContext(ctx, "POST", o.config.SolanaRPCURL, strings.NewReader(bodyStr))
+	if err != nil {
+		return 0
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	httpClient := &http.Client{Timeout: 3 * time.Second}
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		log.Printf("Orchestrator: fetchSolBalance error: %v\n", err)
+		return 0
+	}
+	defer resp.Body.Close()
+
+	var result struct {
+		Result struct {
+			Value uint64 `json:"value"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return 0
+	}
+	return float64(result.Value) / 1e9 // lamports to SOL
+}
+
+// GetIntel returns the intelligence client (for stats endpoint)
+func (o *Orchestrator) GetIntel() *intelligence.Client {
+	return o.intel
+}
+
+// envBoolDefault reads a boolean env var with a default
+func envBoolDefault(key string, def bool) bool {
+	v := os.Getenv(key)
+	if v == "" {
+		return def
+	}
+	return v == "true" || v == "1" || v == "yes"
 }
