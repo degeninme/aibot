@@ -745,6 +745,9 @@ func (s *ChainScannerAgent) fetchMintSupply(mint string) (uint64, error) {
 }
 
 func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
+	// Enrich with metadata from PumpFun API (best-effort, non-blocking)
+	s.enrichTokenMetadata(&token)
+
 	select {
 	case s.tokenChannel <- token:
 		log.Printf("ChainScannerAgent: Token emitted - %s\n", token.TokenAddress)
@@ -752,6 +755,90 @@ func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
 		return
 	default:
 		log.Println("ChainScannerAgent: Warning - token channel full, dropping event")
+	}
+}
+
+// enrichTokenMetadata fetches name/symbol/description from PumpFun's public API.
+// Best effort — silently fails if API is slow or returns nothing.
+// Times out at 1 second to avoid blocking the scanner.
+func (s *ChainScannerAgent) enrichTokenMetadata(token *models.TokenFound) {
+	if token.Metadata == nil {
+		token.Metadata = make(map[string]string)
+	}
+
+	ctx, cancel := context.WithTimeout(s.ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	url := fmt.Sprintf("https://frontend-api.pump.fun/coins/%s", token.TokenAddress)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; PumpBot/1.0)")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var meta struct {
+		Name         string `json:"name"`
+		Symbol       string `json:"symbol"`
+		Description  string `json:"description"`
+		ImageURI     string `json:"image_uri"`
+		Twitter      string `json:"twitter"`
+		Telegram     string `json:"telegram"`
+		Website      string `json:"website"`
+		Creator      string `json:"creator"`
+		MarketCapSOL float64 `json:"market_cap"`
+		USDMarketCap float64 `json:"usd_market_cap"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return
+	}
+
+	if meta.Name != "" {
+		token.Metadata["name"] = meta.Name
+	}
+	if meta.Symbol != "" {
+		token.Metadata["symbol"] = meta.Symbol
+	}
+	if meta.Description != "" {
+		// Truncate to keep prompt size sane
+		desc := meta.Description
+		if len(desc) > 500 {
+			desc = desc[:500] + "..."
+		}
+		token.Metadata["description"] = desc
+	}
+	if meta.Twitter != "" {
+		token.Metadata["twitter"] = meta.Twitter
+	}
+	if meta.Telegram != "" {
+		token.Metadata["telegram"] = meta.Telegram
+	}
+	if meta.Website != "" {
+		token.Metadata["website"] = meta.Website
+	}
+	if meta.USDMarketCap > 0 {
+		token.Metadata["usd_market_cap"] = fmt.Sprintf("%.2f", meta.USDMarketCap)
+	}
+
+	if meta.Name != "" || meta.Symbol != "" {
+		log.Printf("ChainScannerAgent: Enriched %s: name=%q symbol=%q desc=%dchars socials=[tw:%v tg:%v web:%v]\n",
+			token.TokenAddress[:10], meta.Name, meta.Symbol, len(meta.Description),
+			meta.Twitter != "", meta.Telegram != "", meta.Website != "")
 	}
 }
 
