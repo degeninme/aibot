@@ -440,7 +440,7 @@ func (o *Orchestrator) fetchSolBalance(address string) float64 {
 	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
 		return 0
 	}
-	return float64(result.Value) / 1e9 // lamports to SOL
+	return float64(result.Result.Value) / 1e9 // lamports to SOL
 }
 
 // GetIntel returns the intelligence client (for stats endpoint)
