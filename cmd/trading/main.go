@@ -53,6 +53,7 @@ func startAPIServer(cfg *config.Config) {
 	router.HandleFunc("/api/llm/analyze", llmAnalyzeHandler).Methods("POST")
 	router.HandleFunc("/api/llm/chat", llmChatHandler).Methods("POST")
 	router.HandleFunc("/api/llm/stats", llmStatsHandler).Methods("GET")
+	router.HandleFunc("/api/intel/stats", intelStatsHandler).Methods("GET")
 	
 	// Serve frontend static files for all other routes
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./frontend")))
@@ -391,4 +392,18 @@ func tail[T any](s []T, n int) []T {
 		return s
 	}
 	return s[len(s)-n:]
+}
+
+// intelStatsHandler returns Solana Tracker API usage stats
+func intelStatsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	intel := orch.GetIntel()
+	if intel == nil {
+		json.NewEncoder(w).Encode(map[string]bool{"enabled": false})
+		return
+	}
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":    intel.Enabled(),
+		"call_count": intel.CallCount(),
+	})
 }
