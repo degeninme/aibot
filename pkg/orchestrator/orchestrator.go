@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/mumugogoing/meme_bot/pkg/agents/strategy"
 	"github.com/mumugogoing/meme_bot/pkg/agents/telemetry"
 	"github.com/mumugogoing/meme_bot/pkg/config"
+	"github.com/mumugogoing/meme_bot/pkg/llm"
 	"github.com/mumugogoing/meme_bot/pkg/models"
 )
 
@@ -32,6 +34,7 @@ type Orchestrator struct {
 	execution *execution.ExecutionAgent
 	risk      *risk.RiskManagerAgent
 	telemetry *telemetry.TelemetryAgent
+	llm       *llm.Client
 	
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -64,6 +67,8 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		}
 	}()
 
+	llmClient := llm.NewClient()
+
 	return &Orchestrator{
 		config:    cfg,
 		scanner:   scanner.NewChainScannerAgent(cfg),
@@ -75,6 +80,7 @@ func NewOrchestrator(cfg *config.Config) *Orchestrator {
 		execution: exec,
 		risk:      riskMgr,
 		telemetry: telemetry.NewTelemetryAgent(),
+		llm:       llmClient,
 		ctx:       ctx,
 		cancel:    cancel,
 	}
@@ -216,7 +222,60 @@ func (o *Orchestrator) executeCandidate(candidate *models.CandidateToken) {
 	
 	// Check daily reset
 	o.risk.CheckDailyReset()
-	
+
+	// ── TIER 1 LLM FILTER (non-blocking, 2s timeout) ───────────────────────
+	// Runs in parallel with risk checks. If LLM says "don't buy", skip.
+	// If LLM doesn't respond within 2s OR is disabled, proceed without it.
+	if o.llm != nil && o.llm.Enabled() && o.config.LLMFilterEnabled {
+		llmCtx, llmCancel := context.WithTimeout(o.ctx, 2*time.Second)
+		llmResult := make(chan *llm.TokenFilterResult, 1)
+
+		go func() {
+			defer llmCancel()
+			input := llm.TokenFilterInput{
+				Mint:        candidate.Token.TokenAddress,
+				Name:        candidate.Token.Metadata["name"],
+				Symbol:      candidate.Token.Metadata["symbol"],
+				Description: candidate.Token.Metadata["description"],
+				HasTwitter:  candidate.Token.Metadata["twitter"] != "",
+				HasTelegram: candidate.Token.Metadata["telegram"] != "",
+				HasWebsite:  candidate.Token.Metadata["website"] != "",
+			}
+			// Parse dev_pct if present
+			if v := candidate.Token.Metadata["dev_pct"]; v != "" {
+				var f float64
+				fmt.Sscanf(v, "%f", &f)
+				input.DevPctHolds = f
+			}
+
+			result, err := o.llm.FilterToken(llmCtx, input)
+			if err != nil {
+				log.Printf("Orchestrator: LLM filter error for %s: %v\n", candidate.Token.TokenAddress, err)
+				llmResult <- nil
+				return
+			}
+			llmResult <- result
+		}()
+
+		select {
+		case result := <-llmResult:
+			if result != nil {
+				log.Printf("Orchestrator: LLM filter for %s — buy=%v score=%d reason=%q\n",
+					candidate.Token.TokenAddress, result.Buy, result.Score, result.Reason)
+				if !result.Buy {
+					log.Printf("Orchestrator: ❌ LLM REJECTED %s (flags: %v)\n",
+						candidate.Token.TokenAddress, result.RedFlags)
+					o.listing.UpdateStatus(candidate.Token.TokenAddress, "llm_rejected")
+					return
+				}
+			}
+		case <-time.After(2 * time.Second):
+			log.Printf("Orchestrator: LLM filter timed out for %s — proceeding without LLM verdict\n",
+				candidate.Token.TokenAddress)
+			// llmCancel is in goroutine; the goroutine will discard its result
+		}
+	}
+
 	// Check risk management
 	canExecute, reason := o.risk.CanExecute(&candidate.StrategyDecision)
 	if !canExecute {
@@ -284,4 +343,9 @@ func (o *Orchestrator) GetExecution() *execution.ExecutionAgent {
 // GetConfig returns the active configuration
 func (o *Orchestrator) GetConfig() *config.Config {
 	return o.config
+}
+
+// GetLLM returns the LLM client
+func (o *Orchestrator) GetLLM() *llm.Client {
+	return o.llm
 }
