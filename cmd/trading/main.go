@@ -50,6 +50,9 @@ func startAPIServer(cfg *config.Config) {
 	router.HandleFunc("/api/mode", modeHandler).Methods("GET")
 	router.HandleFunc("/api/mode", setModeHandler).Methods("POST")
 	router.HandleFunc("/api/risk/reset", resetExposureHandler).Methods("POST")
+	router.HandleFunc("/api/llm/analyze", llmAnalyzeHandler).Methods("POST")
+	router.HandleFunc("/api/llm/chat", llmChatHandler).Methods("POST")
+	router.HandleFunc("/api/llm/stats", llmStatsHandler).Methods("GET")
 	
 	// Serve frontend static files for all other routes
 	router.PathPrefix("/").Handler(http.FileServer(http.Dir("./frontend")))
@@ -259,4 +262,133 @@ func resetExposureHandler(w http.ResponseWriter, r *http.Request) {
 		"status":  "ok",
 		"message": "exposure cleared",
 	})
+}
+
+// llmAnalyzeHandler (Tier 2) — runs daily reflection on closed trades
+func llmAnalyzeHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	llmClient := orch.GetLLM()
+	if llmClient == nil || !llmClient.Enabled() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "LLM not configured. Set ANTHROPIC_API_KEY in env.",
+		})
+		return
+	}
+
+	execAgent := orch.GetExecution()
+	trades := execAgent.GetClosedTrades()
+
+	if len(trades) < 5 {
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"error":         "not enough closed trades yet",
+			"trades_needed": 5,
+			"trades_have":   len(trades),
+		})
+		return
+	}
+
+	// Cap to last 100 trades to keep prompt size reasonable
+	if len(trades) > 100 {
+		trades = trades[len(trades)-100:]
+	}
+
+	tradesJSON, _ := json.MarshalIndent(trades, "", "  ")
+
+	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	defer cancel()
+
+	analysis, err := llmClient.AnalyzeTrades(ctx, string(tradesJSON))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"analysis":    analysis,
+		"trade_count": len(trades),
+		"stats":       llmClient.Stats(),
+	})
+}
+
+// llmChatHandler (Tier 3) — dashboard chat with the bot state
+func llmChatHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	llmClient := orch.GetLLM()
+	if llmClient == nil || !llmClient.Enabled() {
+		w.WriteHeader(http.StatusServiceUnavailable)
+		json.NewEncoder(w).Encode(map[string]string{
+			"error": "LLM not configured",
+		})
+		return
+	}
+
+	var req struct {
+		Message string `json:"message"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Message == "" {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "message required"})
+		return
+	}
+
+	execAgent := orch.GetExecution()
+	riskMgr := orch.GetRisk()
+
+	// Build current state snapshot
+	state := map[string]interface{}{
+		"wallet_sol":      execAgent.GetWalletBalanceSOL(),
+		"wallet_usd":      execAgent.GetWalletBalanceUSD(),
+		"exposure_usd":    execAgent.GetCurrentExposureUSD(),
+		"risk":            riskMgr.GetStatus(),
+		"recent_trades":   tail(execAgent.GetClosedTrades(), 20),
+		"dry_run":         orch.GetConfig().DryRun,
+		"llm_filter_on":   orch.GetConfig().LLMFilterEnabled,
+	}
+	stateJSON, _ := json.MarshalIndent(state, "", "  ")
+
+	ctx, cancel := context.WithTimeout(r.Context(), 30*time.Second)
+	defer cancel()
+
+	answer, err := llmClient.Chat(ctx, req.Message, string(stateJSON))
+	if err != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"answer": answer,
+		"stats":  llmClient.Stats(),
+	})
+}
+
+// llmStatsHandler returns LLM usage stats
+func llmStatsHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	llmClient := orch.GetLLM()
+	if llmClient == nil {
+		json.NewEncoder(w).Encode(map[string]bool{"enabled": false})
+		return
+	}
+	stats := llmClient.Stats()
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"enabled":             llmClient.Enabled(),
+		"filter_active":       orch.GetConfig().LLMFilterEnabled,
+		"call_count":          stats.CallCount,
+		"total_input_tokens":  stats.TotalInputTokens,
+		"total_output_tokens": stats.TotalOutputTokens,
+		"estimated_cost_usd":  stats.EstimatedCostUSD,
+	})
+}
+
+// tail returns the last n elements of a slice, or all if shorter
+func tail[T any](s []T, n int) []T {
+	if len(s) <= n {
+		return s
+	}
+	return s[len(s)-n:]
 }
