@@ -95,6 +95,7 @@ type pumpPortalRequest struct {
 // Position tracks an open buy
 type Position struct {
 	Mint           string    `json:"mint"`
+	BondingCurve   string    `json:"bonding_curve"` // Dynamic target PDA account
 	EntryPrice     float64   `json:"entry_price"`    // SOL per token (virtual price)
 	TokensHeld     uint64    `json:"tokens_held"`    // raw token amount (with decimals)
 	OriginalTokens uint64    `json:"original_tokens"`
@@ -162,18 +163,19 @@ type ExecutionAgent struct {
 	balanceMu        sync.RWMutex
 	lastBalanceCheck time.Time
 
-	// Cooldown between buys (prevents rapid-fire on multiple new tokens)
-	lastBuyAt time.Time
-	buyMu     sync.Mutex
+	// Cooldown tracking per token to optimize concurrent throughput
+	tokenCooldowns map[string]time.Time
+	buyMu          sync.Mutex
 }
 
 // NewExecutionAgent creates a new execution agent
 func NewExecutionAgent(cfg *config.Config) *ExecutionAgent {
 	agent := &ExecutionAgent{
-		config:       cfg,
-		httpClient:   &http.Client{Timeout: 30 * time.Second},
-		positions:    make(map[string]*Position),
-		sellTxHashes: make(map[string][]string),
+		config:         cfg,
+		httpClient:     &http.Client{Timeout: 30 * time.Second},
+		positions:      make(map[string]*Position),
+		sellTxHashes:   make(map[string][]string),
+		tokenCooldowns: make(map[string]time.Time),
 	}
 
 	log.Println("ExecutionAgent: Using PumpPortal trade-local API (free, no key required)")
@@ -528,21 +530,56 @@ func (e *ExecutionAgent) sellOnPumpFun(ctx context.Context, mint string, percent
 
 // ─── Position tracking and monitoring ────────────────────────────────────────
 
+// resolveBondingCurve discovers the exact structural PDA bump by inspecting live on-chain states
+func (e *ExecutionAgent) resolveBondingCurve(mintStr string) string {
+	mintBytes, err := base58Decode(mintStr)
+	if err != nil {
+		return ""
+	}
+	programBytes, _ := base58Decode("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+
+	// Dynamic brute-force lookup across active Anchor seeds descending from 255 down to 250
+	for bump := 255; bump >= 250; bump-- {
+		bcAddr := deriveBC(mintBytes[:32], programBytes[:32], byte(bump))
+		bcPubkey := base58Encode(bcAddr)
+
+		result, err := e.rpcCall("getAccountInfo", []interface{}{
+			bcPubkey,
+			map[string]interface{}{"encoding": "base64", "commitment": "confirmed"},
+		})
+		if err == nil && result != nil && string(result) != "null" {
+			var out struct {
+				Value *struct {
+					Data []string `json:"data"`
+				} `json:"value"`
+			}
+			if json.Unmarshal(result, &out) == nil && out.Value != nil && len(out.Value.Data) > 0 {
+				return bcPubkey // Found the actual matching programmatic layout!
+			}
+		}
+	}
+	// Fallback to standard 255 approximation for simulation/dry runs before mint blocks clear
+	bcAddr := deriveBC(mintBytes[:32], programBytes[:32], 255)
+	return base58Encode(bcAddr)
+}
+
 // recordPosition stores a new position after successful buy
 func (e *ExecutionAgent) recordPosition(mint string, solSpent float64, txHash string) {
 	e.positionsMu.Lock()
 	defer e.positionsMu.Unlock()
 
-	// Entry price estimation: we'll fetch actual tokens-received from balance later
-	// For now we record the position and update price on first check
+	// Resolve the dynamic bonding curve address once at initialization to prevent metric blindness
+	resolvedBC := e.resolveBondingCurve(mint)
+
 	e.positions[mint] = &Position{
 		Mint:           mint,
+		BondingCurve:   resolvedBC,
 		SolSpent:       solSpent,
 		OpenedAt:       time.Now(),
 		BuyTxHash:      txHash,
 		PeakMultiplier: 1.0,
 	}
-	log.Printf("ExecutionAgent: Position opened: %s, %.4f SOL\n", mint, solSpent)
+	log.Printf("ExecutionAgent: Position opened: %s, Derived Curve PDA: %s, %.4f SOL\n", mint, resolvedBC, solSpent)
 }
 
 // fetchTokenBalance gets the wallet's balance of a specific token
@@ -587,18 +624,13 @@ func (e *ExecutionAgent) fetchTokenBalance(mint string) (uint64, uint8, error) {
 	return amt.Uint64(), decimals, nil
 }
 
-// getCurrentPriceSOL gets current price by querying PumpPortal for a 0.001 SOL sell quote
-// Returns SOL per token (very rough estimate)
+// getCurrentMultiplier reads current price by parsing raw layout bytes
 func (e *ExecutionAgent) getCurrentMultiplier(pos *Position) float64 {
-	// Use bonding curve account data to estimate price
-	// virtualSolReserves / virtualTokenReserves = price per token in SOL
-	mintBytes, err := base58Decode(pos.Mint)
-	if err != nil {
-		return 0
+	bcPubkey := pos.BondingCurve
+	if bcPubkey == "" {
+		bcPubkey = e.resolveBondingCurve(pos.Mint)
+		pos.BondingCurve = bcPubkey
 	}
-	programBytes, _ := base58Decode("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
-	bcAddr := deriveBC(mintBytes[:32], programBytes[:32])
-	bcPubkey := base58Encode(bcAddr)
 
 	result, err := e.rpcCall("getAccountInfo", []interface{}{
 		bcPubkey,
@@ -622,9 +654,7 @@ func (e *ExecutionAgent) getCurrentMultiplier(pos *Position) float64 {
 	if err != nil || len(dataBytes) < 48 {
 		return 0
 	}
-	// BondingCurve layout after 8-byte discriminator:
-	// virtual_token_reserves: u64 LE [8..16]
-	// virtual_sol_reserves:   u64 LE [16..24]
+	
 	virtTokens := readU64LE(dataBytes[8:16])
 	virtSol := readU64LE(dataBytes[16:24])
 	if virtTokens == 0 {
@@ -633,7 +663,6 @@ func (e *ExecutionAgent) getCurrentMultiplier(pos *Position) float64 {
 	currentPrice := float64(virtSol) / float64(virtTokens)
 
 	if pos.EntryPrice == 0 {
-		// First check — set entry price from current and return 1.0
 		pos.EntryPrice = currentPrice
 		return 1.0
 	}
@@ -651,15 +680,12 @@ func readU64LE(b []byte) uint64 {
 	return v
 }
 
-// deriveBC derives the bonding curve PDA using bump=255 (works for most PumpFun tokens)
-// KNOWN LIMITATION: ~50% of tokens have BC at lower bumps. Price reading will fail for those.
-// For full correctness we'd need Ed25519 off-curve validation. This approximation is acceptable
-// because we have a price-independent timeout safety net.
-func deriveBC(mint, program []byte) []byte {
+// deriveBC accepts a dynamic bump byte parameter to look up different addresses
+func deriveBC(mint, program []byte, bump byte) []byte {
 	h := sha256.New()
 	h.Write([]byte("bonding-curve"))
 	h.Write(mint)
-	h.Write([]byte{255})
+	h.Write([]byte{bump})
 	h.Write(program)
 	h.Write([]byte("ProgramDerivedAddress"))
 	return h.Sum(nil)
@@ -689,462 +715,4 @@ func (e *ExecutionAgent) recordOutcome(mint string, reason string) {
 		pnlPct = (pnlSol / pos.SolSpent) * 100
 	}
 
-	outcome := TradeOutcome{
-		Mint:           mint,
-		OpenedAt:       pos.OpenedAt,
-		ClosedAt:       now,
-		Duration:       now.Sub(pos.OpenedAt),
-		SolIn:          pos.SolSpent,
-		SolOut:         pos.SolRecovered,
-		PnLSol:         pnlSol,
-		PnLPct:         pnlPct,
-		PeakMultiplier: pos.PeakMultiplier,
-		ExitReason:     reason,
-		BuyTxHash:      pos.BuyTxHash,
-		SellTxHashes:   sellHashes,
-	}
-
-	e.closedTradesMu.Lock()
-	e.closedTrades = append(e.closedTrades, outcome)
-	e.closedTradesMu.Unlock()
-
-	// Log in a single-line JSON format that's easy to grep/parse from Railway logs
-	jsonStr, _ := json.Marshal(outcome)
-	log.Printf("TRADE_OUTCOME %s\n", string(jsonStr))
-
-	// Also log a human-readable summary
-	emoji := "🔴"
-	if pnlSol > 0 {
-		emoji = "🟢"
-	} else if pnlSol == 0 {
-		emoji = "⚪"
-	}
-	log.Printf("%s Closed %s: PnL=%.4f SOL (%.1f%%) peak=%.2fx duration=%v reason=%s\n",
-		emoji, mint[:10], pnlSol, pnlPct, pos.PeakMultiplier, outcome.Duration.Truncate(time.Second), reason)
-
-	// Log running aggregate stats every close
-	e.logAggregateStats()
-}
-
-// recordSellTx remembers a sell tx hash for the outcome record
-func (e *ExecutionAgent) recordSellTx(mint, txHash string, solReceived float64) {
-	e.positionsMu.Lock()
-	if pos, ok := e.positions[mint]; ok {
-		pos.SolRecovered += solReceived
-	}
-	e.positionsMu.Unlock()
-
-	e.sellTxHashes[mint] = append(e.sellTxHashes[mint], txHash)
-}
-
-// logAggregateStats prints a one-line summary of all closed trades so far
-func (e *ExecutionAgent) logAggregateStats() {
-	e.closedTradesMu.RLock()
-	defer e.closedTradesMu.RUnlock()
-
-	if len(e.closedTrades) == 0 {
-		return
-	}
-
-	totalIn, totalOut := 0.0, 0.0
-	wins, losses, breakeven := 0, 0, 0
-	timeouts, stoplosses, tp1s, tp2s, trailing, phantoms := 0, 0, 0, 0, 0, 0
-	maxWin, maxLoss := 0.0, 0.0
-	totalPeakMult := 0.0
-
-	for _, t := range e.closedTrades {
-		totalIn += t.SolIn
-		totalOut += t.SolOut
-		totalPeakMult += t.PeakMultiplier
-		if t.PnLSol > 0 {
-			wins++
-			if t.PnLSol > maxWin {
-				maxWin = t.PnLSol
-			}
-		} else if t.PnLSol < 0 {
-			losses++
-			if t.PnLSol < maxLoss {
-				maxLoss = t.PnLSol
-			}
-		} else {
-			breakeven++
-		}
-		switch t.ExitReason {
-		case "timeout":
-			timeouts++
-		case "stop_loss":
-			stoplosses++
-		case "tp1":
-			tp1s++
-		case "tp2":
-			tp2s++
-		case "trailing_stop":
-			trailing++
-		case "phantom":
-			phantoms++
-		}
-	}
-
-	n := len(e.closedTrades)
-	winRate := float64(wins) / float64(n) * 100
-	avgPeak := totalPeakMult / float64(n)
-
-	log.Printf("=== TRADE STATS (n=%d) === Win%%=%.0f%% NetPnL=%.4f SOL MaxWin=%.4f MaxLoss=%.4f AvgPeak=%.2fx\n",
-		n, winRate, totalOut-totalIn, maxWin, maxLoss, avgPeak)
-	log.Printf("=== EXITS === TP1=%d TP2=%d TrailStop=%d StopLoss=%d Timeout=%d Phantom=%d\n",
-		tp1s, tp2s, trailing, stoplosses, timeouts, phantoms)
-}
-
-// GetClosedTrades returns all closed trade outcomes (for an HTTP endpoint maybe)
-func (e *ExecutionAgent) GetClosedTrades() []TradeOutcome {
-	e.closedTradesMu.RLock()
-	defer e.closedTradesMu.RUnlock()
-	result := make([]TradeOutcome, len(e.closedTrades))
-	copy(result, e.closedTrades)
-	return result
-}
-
-// GetCurrentExposureUSD returns the total USD value invested in currently open positions
-// (based on entry cost, not current value)
-func (e *ExecutionAgent) GetCurrentExposureUSD() float64 {
-	e.positionsMu.RLock()
-	defer e.positionsMu.RUnlock()
-	total := 0.0
-	for _, pos := range e.positions {
-		total += pos.SolSpent * 86.0
-	}
-	return total
-}
-
-// monitorPositionsLoop runs periodically to check positions for TP/SL/timeout
-func (e *ExecutionAgent) monitorPositionsLoop() {
-	if e.privateKey == nil {
-		return
-	}
-	ticker := time.NewTicker(5 * time.Second)
-	defer ticker.Stop()
-	for range ticker.C {
-		e.checkAllPositions()
-	}
-}
-
-func (e *ExecutionAgent) checkAllPositions() {
-	e.positionsMu.RLock()
-	mints := make([]string, 0, len(e.positions))
-	for mint := range e.positions {
-		mints = append(mints, mint)
-	}
-	e.positionsMu.RUnlock()
-
-	for _, mint := range mints {
-		e.checkPosition(mint)
-	}
-}
-
-func (e *ExecutionAgent) checkPosition(mint string) {
-	e.positionsMu.Lock()
-	pos, ok := e.positions[mint]
-	if !ok {
-		e.positionsMu.Unlock()
-		return
-	}
-	tp1Done := pos.TP1Done
-	tp2Done := pos.TP2Done
-	openedAt := pos.OpenedAt
-	e.positionsMu.Unlock()
-
-	age := time.Since(openedAt)
-
-	// ── PRICE-INDEPENDENT TIMEOUT (works even when bonding curve read fails) ──
-	// If we can't read price, still enforce timeout to avoid stuck positions
-	maxHoldMin := 5
-	if v := os.Getenv("MAX_HOLD_MINUTES"); v != "" {
-		var n int
-		fmt.Sscanf(v, "%d", &n)
-		if n > 0 {
-			maxHoldMin = n
-		}
-	}
-	if !tp1Done && age > time.Duration(maxHoldMin)*time.Minute {
-		log.Printf("ExecutionAgent: TIMEOUT (%v old, no TP1, force selling) — %s\n",
-			age.Truncate(time.Second), mint)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, 100)
-		if err != nil {
-			log.Printf("ExecutionAgent: Timeout sell failed: %v\n", err)
-		} else {
-			estSol := pos.SolSpent // assume break-even if no price data
-			e.recordSellTx(mint, txHash, estSol)
-			e.recordOutcome(mint, "timeout")
-			log.Printf("ExecutionAgent: ✅ Position closed via timeout: %s\n", txHash)
-		}
-		return
-	}
-
-	// Get price for TP/SL checks
-	mult := e.getCurrentMultiplier(pos)
-	if mult <= 0 {
-		// Log every ~30s so we know monitor is alive but price is unreadable
-		if int(age.Seconds())%30 < 5 {
-			log.Printf("ExecutionAgent: Position %s — age=%v (price unreadable, waiting for timeout)\n",
-				mint[:10], age.Truncate(time.Second))
-		}
-		return
-	}
-
-	// Track peak for trailing stop
-	e.positionsMu.Lock()
-	if mult > pos.PeakMultiplier {
-		pos.PeakMultiplier = mult
-	}
-	peakMult := pos.PeakMultiplier
-	e.positionsMu.Unlock()
-
-	log.Printf("ExecutionAgent: Position %s — multiplier=%.2fx peak=%.2fx age=%v\n",
-		mint[:10], mult, peakMult, age.Truncate(time.Second))
-
-	// Configurable TP/SL levels via env vars
-	tp1Mult := envFloat("TP1_MULTIPLIER", 2.0)
-	tp2Mult := envFloat("TP2_MULTIPLIER", 3.0)
-	tp1Pct := envInt("TP1_SELL_PCT", 50)
-	tp2Pct := envInt("TP2_SELL_PCT", 50)
-	stopLoss := envFloat("STOP_LOSS_MULT", 0.5) // sell when price drops below this multiplier
-	trailingDrop := envFloat("TRAILING_STOP_PCT", 0.7) // sell if mult <= peak * this
-
-	// ── TP1: configurable → sell TP1_SELL_PCT% ────────────────
-	if !tp1Done && mult >= tp1Mult {
-		log.Printf("ExecutionAgent: TP1 hit (%.2fx >= %.2fx) — selling %d%% of %s\n",
-			mult, tp1Mult, tp1Pct, mint)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, tp1Pct)
-		if err != nil {
-			log.Printf("ExecutionAgent: TP1 sell failed: %v\n", err)
-		} else {
-			estSol := pos.SolSpent * mult * (float64(tp1Pct) / 100.0)
-			e.recordSellTx(mint, txHash, estSol)
-			e.positionsMu.Lock()
-			pos.TP1Done = true
-			e.positionsMu.Unlock()
-			log.Printf("ExecutionAgent: ✅ TP1 sell complete: %s (est %.4f SOL recovered)\n", txHash, estSol)
-		}
-		return
-	}
-
-	// ── TP2: configurable ──────────────────────────────────────
-	if tp1Done && !tp2Done && mult >= tp2Mult {
-		log.Printf("ExecutionAgent: TP2 hit (%.2fx >= %.2fx) — selling %d%% of remaining of %s\n",
-			mult, tp2Mult, tp2Pct, mint)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, tp2Pct)
-		if err != nil {
-			log.Printf("ExecutionAgent: TP2 sell failed: %v\n", err)
-		} else {
-			estSol := pos.SolSpent * mult * 0.25 // rough estimate of recovered SOL
-			e.recordSellTx(mint, txHash, estSol)
-			e.positionsMu.Lock()
-			pos.TP2Done = true
-			e.positionsMu.Unlock()
-			log.Printf("ExecutionAgent: ✅ TP2 sell complete: %s (est %.4f SOL recovered)\n", txHash, estSol)
-		}
-		return
-	}
-
-	// ── Trailing stop on remaining 25% after TP2 ──────────────
-	if tp2Done && peakMult > 0 && mult <= peakMult*trailingDrop {
-		log.Printf("ExecutionAgent: Trailing stop hit (peak=%.2fx now=%.2fx) — selling 100%% of %s\n",
-			peakMult, mult, mint)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, 100)
-		if err != nil {
-			log.Printf("ExecutionAgent: Trailing stop sell failed: %v\n", err)
-		} else {
-			estSol := e.estimateCurrentSolValue(mint, pos.SolSpent, mult)
-			e.recordSellTx(mint, txHash, estSol)
-			e.recordOutcome(mint, "trailing_stop")
-			log.Printf("ExecutionAgent: ✅ Position closed via trailing stop: %s\n", txHash)
-		}
-		return
-	}
-
-	// ── Hard stop loss (pre-TP1 only) ─────────────────────────
-	if !tp1Done && mult <= stopLoss {
-		log.Printf("ExecutionAgent: STOP LOSS hit (%.2fx <= %.2fx) — selling 100%% of %s\n",
-			mult, stopLoss, mint)
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		txHash, err := e.sellOnPumpFun(ctx, mint, 100)
-		if err != nil {
-			log.Printf("ExecutionAgent: Stop loss sell failed: %v\n", err)
-		} else {
-			estSol := e.estimateCurrentSolValue(mint, pos.SolSpent, mult)
-			e.recordSellTx(mint, txHash, estSol)
-			e.recordOutcome(mint, "stop_loss")
-			log.Printf("ExecutionAgent: ✅ Position closed via stop loss: %s\n", txHash)
-		}
-		return
-	}
-
-	// (Timeout is now handled at the top of checkPosition, price-independent)
-}
-
-// envFloat reads a float env var with a default
-func envFloat(key string, def float64) float64 {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	var f float64
-	if _, err := fmt.Sscanf(v, "%f", &f); err == nil && f > 0 {
-		return f
-	}
-	return def
-}
-
-// envInt reads an int env var with a default
-func envInt(key string, def int) int {
-	v := os.Getenv(key)
-	if v == "" {
-		return def
-	}
-	var n int
-	if _, err := fmt.Sscanf(v, "%d", &n); err == nil && n > 0 {
-		return n
-	}
-	return def
-}
-
-
-// estimateCurrentSolValue estimates how much SOL the remaining position is worth
-func (e *ExecutionAgent) estimateCurrentSolValue(mint string, originalSol, currentMult float64) float64 {
-	return originalSol * currentMult
-}
-
-// ─── Public interface ─────────────────────────────────────────────────────────
-
-func (e *ExecutionAgent) Execute(ctx context.Context, candidate *models.CandidateToken) (*models.ExecutionResult, error) {
-	// Apply any runtime overrides (e.g. dashboard toggle) before reading flags
-	e.config.ApplyOverrides()
-
-	log.Printf("ExecutionAgent: Executing trade for %s\n", candidate.Token.TokenAddress)
-
-	result := &models.ExecutionResult{
-		TokenAddress: candidate.Token.TokenAddress,
-		Chain:        candidate.Token.Chain,
-		AmountUSD:    candidate.StrategyDecision.SuggestedAmountUSD,
-		Timestamp:    time.Now(),
-		Status:       "pending",
-	}
-
-	solAmount := candidate.StrategyDecision.SuggestedAmountUSD / 86.0
-	if solAmount < 0.001 {
-		solAmount = 0.001
-	}
-
-	// Buy cooldown: prevent rapid-fire trades on multiple new tokens
-	cooldownSec := 30
-	if v := os.Getenv("BUY_COOLDOWN_SEC"); v != "" {
-		var n int
-		fmt.Sscanf(v, "%d", &n)
-		if n > 0 {
-			cooldownSec = n
-		}
-	}
-	e.buyMu.Lock()
-	timeSince := time.Since(e.lastBuyAt)
-	if timeSince < time.Duration(cooldownSec)*time.Second {
-		e.buyMu.Unlock()
-		waitNeeded := time.Duration(cooldownSec)*time.Second - timeSince
-		log.Printf("ExecutionAgent: Cooldown active — last buy was %v ago, need to wait %v more\n",
-			timeSince.Truncate(time.Second), waitNeeded.Truncate(time.Second))
-		result.Status = "failed"
-		result.Error = "buy_cooldown_active"
-		return result, fmt.Errorf("buy cooldown active")
-	}
-	e.lastBuyAt = time.Now()
-	e.buyMu.Unlock()
-
-	// ── DRY_RUN MODE: simulate the entire trade lifecycle without spending real money ──
-	if e.config.DryRun {
-		log.Printf("ExecutionAgent: [DRY_RUN] 🎯 Would BUY %s for %.4f SOL ($%.2f)\n",
-			candidate.Token.TokenAddress, solAmount, candidate.StrategyDecision.SuggestedAmountUSD)
-
-		fakeTx := "DRY_RUN_BUY_" + candidate.Token.TokenAddress[:8] + "_" +
-			fmt.Sprintf("%d", time.Now().Unix())
-
-		// Record a real position so monitor loop runs simulated TP/SL/timeout checks
-		// EntryPrice will be set on first price read (or stay 0 if PDA broken)
-		e.recordPosition(candidate.Token.TokenAddress, solAmount, fakeTx)
-
-		result.Status = "confirmed"
-		result.TxHash = fakeTx
-		return result, nil
-	}
-
-	if candidate.Token.Chain != models.ChainSolana {
-		result.Status = "failed"
-		result.Error = "only Solana supported"
-		return result, fmt.Errorf("unsupported chain: %s", candidate.Token.Chain)
-	}
-
-	txHash, err := e.buyOnPumpFun(ctx, candidate.Token.TokenAddress, solAmount)
-	if err != nil {
-		log.Printf("ExecutionAgent: Buy failed: %v\n", err)
-		result.Status = "failed"
-		result.Error = err.Error()
-		return result, err
-	}
-
-	// Wait up to 30s for buy tx to confirm on-chain before recording the position
-	confirmed := false
-	for attempt := 0; attempt < 6; attempt++ {
-		time.Sleep(5 * time.Second)
-		bal, _, err := e.fetchTokenBalance(candidate.Token.TokenAddress)
-		if err == nil && bal > 0 {
-			confirmed = true
-			log.Printf("ExecutionAgent: ✓ Buy confirmed on-chain (%d tokens) for %s after %ds\n",
-				bal, candidate.Token.TokenAddress[:10], (attempt+1)*5)
-			break
-		}
-	}
-
-	if !confirmed {
-		log.Printf("ExecutionAgent: ⚠️  Buy tx sent but tokens never appeared (likely failed) — NOT recording position for %s\n",
-			candidate.Token.TokenAddress)
-		result.Status = "failed"
-		result.Error = "buy_tx_not_confirmed"
-		result.TxHash = txHash
-		return result, fmt.Errorf("buy tx never confirmed on-chain")
-	}
-
-	// Record the position for monitoring (only after confirmation)
-	e.recordPosition(candidate.Token.TokenAddress, solAmount, txHash)
-
-	// Refresh cached balance after buy
-
-	// Refresh cached balance after buy
-	if bal, err := e.fetchWalletBalanceSOL(); err == nil {
-		e.balanceMu.Lock()
-		e.cachedBalanceSOL = bal
-		e.lastBalanceCheck = time.Now()
-		e.balanceMu.Unlock()
-	}
-
-	result.Status = "confirmed"
-	result.TxHash = txHash
-	return result, nil
-}
-
-func (e *ExecutionAgent) Simulate(ctx context.Context, candidate *models.CandidateToken) (bool, error) {
-	return true, nil
-}
-
-func (e *ExecutionAgent) GetSignerType() string {
-	if e.privateKey != nil {
-		return "private_key"
-	}
-	return "none"
-}
+	outcome :=
