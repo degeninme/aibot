@@ -90,6 +90,9 @@ type Config struct {
 	BlacklistedTokens   []string
 	BlacklistedCreators []string
 	WhitelistedTokens   []string
+
+	// LLM features
+	LLMFilterEnabled bool // Tier 1: per-token LLM sanity filter (Haiku)
 }
 
 // ApplyOverrides syncs runtime overrides (e.g. from dashboard toggle) into the config struct.
@@ -113,6 +116,7 @@ func LoadConfig() *Config {
 		// General
 		DryRun:              getEnvBool("DRY_RUN", true),
 		AutoExecute:         getEnvBool("AUTO_EXECUTE", false),
+		LLMFilterEnabled:    getEnvBool("LLM_FILTER_ENABLED", false),
 		
 		// Chain settings
 		SolanaRPCURL:        getEnv("SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com"),
