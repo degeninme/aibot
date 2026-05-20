@@ -4,6 +4,7 @@ import (
 	"log"
 	"math"
 	"math/rand"
+	"strconv"
 	"sync"
 	"time"
 
@@ -58,16 +59,16 @@ func (s *StrategyEvaluatorAgent) Evaluate(
 		Rationale:    []string{},
 	}
 
-	decision.WinProbability = s.calculateWinProbability(safety, offchain, token)
+	decision.WinProbability = s.calculateWinProbability(safety, offchain, token, decision)
 	decision.ExpectedROI, decision.ExpectedROIStd = s.calculateExpectedROI(offchain, token)
-	decision.Confidence = s.determineConfidence(safety, decision.WinProbability)
+	decision.Confidence = s.determineConfidence(safety, decision.WinProbability, token)
 	decision.Action = s.determineAction(decision)
 	decision.SuggestedAmountUSD = s.calculatePositionSize(decision)
 	decision.StopLossPct = s.calculateStopLoss(decision)
 	decision.TakeProfitPct = s.calculateTakeProfit(decision)
 	decision.TimeHorizonMinutes = s.calculateTimeHorizon(decision)
 
-	log.Printf("StrategyEvaluatorAgent: Token %s - WinProb: %.2f, Action: %s, Confidence: %s\n",
+	log.Printf("StrategyEvaluatorAgent: Token %s - WinMarketProb: %.2f, Action: %s, Confidence: %s\n",
 		token.Token.TokenAddress, decision.WinProbability, decision.Action, decision.Confidence)
 
 	return decision, nil
@@ -77,77 +78,105 @@ func (s *StrategyEvaluatorAgent) calculateWinProbability(
 	safety *models.SafetyReport,
 	offchain *models.OffChainMetrics,
 	token models.PreFilteredToken,
+	decision *models.StrategyDecision,
 ) float64 {
-	// Cannot trade at all = 0
+	// 1. Hard Rules Check
 	if !safety.CanBuy || !safety.CanSell {
+		decision.Rationale = append(decision.Rationale, "BLOCK: Token transfer flags reporting un-tradeable state")
 		return 0.0
 	}
 
-	// Higher base for new PumpFun tokens — they have 0 volume/social by nature
-	baseProb := 0.65
+	isPumpFun := token.Token.Metadata["source"] == "pumpfun"
 
-	// Safety bonuses
-	if safety.HoneypotScore < 0.1 {
-		baseProb += 0.08
-	} else if safety.HoneypotScore > s.config.MaxHoneypotScore {
-		baseProb -= 0.15
+	// 2. Base Configuration Adjustments
+	var score float64
+	if isPumpFun {
+		// PumpFun baseline configuration starts lower because noise floor is high
+		score = 0.40
+	} else {
+		score = 0.55
 	}
 
-	if safety.LiquidityLocked {
-		baseProb += 0.07
+	// 3. Evaluate Metadata Verification Signals
+	hasTwitter := token.Token.Metadata["twitter"] != "" && token.Token.Metadata["twitter"] != "null"
+	hasTelegram := token.Token.Metadata["telegram"] != "" && token.Token.Metadata["telegram"] != "null"
+	hasWebsite := token.Token.Metadata["website"] != "" && token.Token.Metadata["website"] != "null"
+
+	if isPumpFun {
+		if hasTwitter && hasTelegram {
+			score += 0.25
+			decision.Rationale = append(decision.Rationale, "BONUS: Full digital footprint matched (X & TG links verified)")
+		} else if hasTwitter || hasTelegram {
+			score += 0.10
+			decision.Rationale = append(decision.Rationale, "NEUTRAL: Partial digital marketing footprints matched")
+		} else {
+			// Severe penalty for completely anonymous programmatic bot creation arrays
+			score -= 0.35
+			decision.Rationale = append(decision.Rationale, "PENALTY: Blind metadata submission detected (No socials provided)")
+		}
+
+		// 4. Evaluate Dev Wallet Skin in the Game / Capitalization Constraints
+		if devBalStr, ok := token.Token.Metadata["dev_sol_balance"]; ok {
+			if devBal, err := strconv.ParseFloat(devBalStr, 64); err == nil {
+				if devBal >= 1.5 {
+					score += 0.15
+					decision.Rationale = append(decision.Rationale, "BONUS: Heavily capitalized creation wallet (>1.5 SOL balance)")
+				} else if devBal < 0.2 {
+					score -= 0.15
+					decision.Rationale = append(decision.Rationale, "PENALTY: Under-capitalized creation burner wallet (<0.2 SOL balance)")
+				}
+			}
+		}
+
+		// 5. Evaluate Structural Insider Distribution Metrics (Bundler Protection)
+		if devBuyPctStr, ok := token.Token.Metadata["dev_buy_pct"]; ok {
+			if devBuyPct, err := strconv.ParseFloat(devBuyPctStr, 64); err == nil {
+				if devBuyPct > 12.0 {
+					score -= 0.30
+					decision.Rationale = append(decision.Rationale, "PENALTY: Massive developer transaction bundle concentration detected")
+				} else if devBuyPct > 0.0 && devBuyPct <= 5.0 {
+					score += 0.10
+					decision.Rationale = append(decision.Rationale, "BONUS: Organic developer entry position distribution matched")
+				}
+			}
+		}
+	} else {
+		// Standard Non-Pump DEX Safety Scoring Realignment
+		if safety.HoneypotScore < 0.1 {
+			score += 0.08
+		} else if safety.HoneypotScore > s.config.MaxHoneypotScore {
+			score -= 0.15
+		}
+		if safety.LiquidityLocked {
+			score += 0.07
+		}
+		if safety.OwnerControls.Renounced {
+			score += 0.06
+		}
 	}
 
-	if safety.OwnerControls.Renounced {
-		baseProb += 0.06
-	}
-
-	if !safety.OwnerControls.HasBlacklist && !safety.OwnerControls.HasTransferHook {
-		baseProb += 0.04
-	}
-
-	// Volume bonus (optional — new tokens won't have this yet)
-	if offchain.Volume24hDEX >= s.config.MinVolumeDEX {
-		baseProb += 0.08
-	}
-
-	// Social bonus (optional)
-	totalMentions := 0
-	for _, count := range offchain.SocialMentions {
-		totalMentions += count
-	}
-	if totalMentions > 50 {
-		baseProb += 0.06
-	}
-
-	// Velocity
+	// 6. Velocity and Priority Processing
 	switch offchain.Velocity {
 	case "rising":
-		baseProb += 0.05
+		score += 0.08
+		decision.Rationale = append(decision.Rationale, "BONUS: Dynamic buyer transaction signature velocity accelerating")
 	case "falling":
-		baseProb -= 0.05
-	}
-	// "stable" or "" (unknown for brand-new tokens) = no change
-
-	// Priority
-	switch token.Priority {
-	case "high":
-		baseProb += 0.05
-	case "low":
-		baseProb -= 0.03
+		score -= 0.10
+		decision.Rationale = append(decision.Rationale, "PENALTY: Momentum loss identified over monitoring interval")
 	}
 
-	// PumpFun source bonus
-	if token.Token.Metadata["source"] == "pumpfun" {
-		baseProb += 0.02
+	if token.Priority == "high" {
+		score += 0.05
 	}
 
-	if baseProb > 1.0 {
-		baseProb = 1.0
+	// Normalize bound limits
+	if score > 1.0 {
+		score = 1.0
 	}
-	if baseProb < 0.0 {
-		baseProb = 0.0
+	if score < 0.0 {
+		score = 0.0
 	}
-	return baseProb
+	return score
 }
 
 func (s *StrategyEvaluatorAgent) calculateExpectedROI(
@@ -170,7 +199,25 @@ func (s *StrategyEvaluatorAgent) calculateExpectedROI(
 func (s *StrategyEvaluatorAgent) determineConfidence(
 	safety *models.SafetyReport,
 	winProb float64,
+	token models.PreFilteredToken,
 ) string {
+	isPumpFun := token.Token.Metadata["source"] == "pumpfun"
+
+	if isPumpFun {
+		// Strict structural rules for high-confidence allocation targets on PumpFun
+		hasTwitter := token.Token.Metadata["twitter"] != "" && token.Token.Metadata["twitter"] != "null"
+		hasTelegram := token.Token.Metadata["telegram"] != "" && token.Token.Metadata["telegram"] != "null"
+		
+		if winProb >= 0.75 && hasTwitter && hasTelegram {
+			return "high"
+		}
+		if winProb >= 0.55 && (hasTwitter || hasTelegram) {
+			return "medium"
+		}
+		return "low"
+	}
+
+	// Fallback to legacy safety matrices for standard Raydium DEX pools
 	if winProb >= 0.82 && safety.HoneypotScore < 0.1 {
 		return "high"
 	}
@@ -188,25 +235,21 @@ func (s *StrategyEvaluatorAgent) determineAction(decision *models.StrategyDecisi
 		}
 		return "list"
 	}
-	if decision.WinProbability >= 0.60 {
+	if decision.WinProbability >= 0.50 {
 		return "monitor"
 	}
 	return "skip"
 }
 
 func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.StrategyDecision) float64 {
-	// Apply any runtime config overrides (e.g. dashboard DRY/LIVE toggle)
 	s.config.ApplyOverrides()
 
-	// In DRY_RUN mode, use a simulated $500 balance for realistic position sizing
 	balance := s.liveBalance()
 	if s.config.DryRun {
-		balance = 500.0 // simulated capital for paper trading
+		balance = 500.0 
 	}
 
-	// Reserve some SOL for transaction fees & rent
 	const reserveUSD = 2.0
-
 	available := balance - reserveUSD
 	if available <= 0.5 {
 		log.Printf("StrategyEvaluatorAgent: Balance too low ($%.2f, reserve=$%.2f) — skipping\n",
@@ -214,33 +257,30 @@ func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.Strategy
 		return 0
 	}
 
-	// Cap by single position percentage
 	maxPosition := available * s.config.SinglePositionPct
 	if maxPosition > available {
 		maxPosition = available
 	}
 
-	// Apply confidence multiplier
 	multiplier := 1.0
 	switch decision.Confidence {
+	case "high":
+		multiplier = 1.0
 	case "medium":
-		multiplier = 0.7
+		multiplier = 0.65
 	case "low":
-		multiplier = 0.4
+		multiplier = 0.25
 	}
 
 	target := maxPosition * multiplier
 
-	// Randomize 70-100% of target to vary entry sizes (helps with diversification)
-	jitter := 0.7 + rand.Float64()*0.3
+	// Secure diversification window ranges
+	jitter := 0.75 + rand.Float64()*0.25
 	suggested := target * jitter
 
-	// Floor at $0.50 to avoid dust trades that don't cover fees
 	if suggested < 0.5 {
 		suggested = 0.5
 	}
-
-	// Don't suggest more than what's available
 	if suggested > available {
 		suggested = available
 	}
