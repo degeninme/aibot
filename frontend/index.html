@@ -690,6 +690,30 @@
         </table>
       </div>
     </div>
+
+    <!-- AI Assistant -->
+    <div class="panel">
+      <div class="panel-header">
+        <span class="panel-title">AI Assistant <span class="panel-meta" id="llm-stats">—</span></span>
+        <button class="btn" id="analyze-btn">ANALYZE TRADES</button>
+      </div>
+      <div style="padding: 14px;">
+        <div id="chat-history" style="min-height: 60px; max-height: 320px; overflow-y: auto; font-size: 12px; line-height: 1.6; margin-bottom: 12px;">
+          <div style="color: var(--text-faint); font-size: 11px;">Ask anything about your bot's behavior, recent trades, or current state. Examples:
+            <ul style="margin: 4px 0 0 16px; padding: 0;">
+              <li>"What's my worst trade today?"</li>
+              <li>"Why are most trades timing out?"</li>
+              <li>"Should I change my TP1 multiplier?"</li>
+            </ul>
+          </div>
+        </div>
+        <div style="display: flex; gap: 8px;">
+          <input id="chat-input" type="text" placeholder="Ask the bot…"
+                 style="flex: 1; padding: 8px 12px; background: var(--bg); border: 1px solid var(--border-bright); color: var(--text); font-family: inherit; font-size: 12px; border-radius: 2px;" />
+          <button class="btn" id="chat-send-btn">SEND</button>
+        </div>
+      </div>
+    </div>
   </section>
 
 </main>
@@ -987,6 +1011,104 @@
       alert('Reset failed: ' + e.message);
     }
   });
+
+  // ── LLM AI Assistant ─────────────────────────────────────────────
+  const chatHistoryEl = document.getElementById('chat-history');
+  const chatInputEl = document.getElementById('chat-input');
+  const chatSendBtn = document.getElementById('chat-send-btn');
+  const analyzeBtn = document.getElementById('analyze-btn');
+
+  function appendChat(role, text) {
+    const isUser = role === 'user';
+    const div = document.createElement('div');
+    div.style.marginBottom = '10px';
+    const labelColor = isUser ? 'var(--blue)' : 'var(--green)';
+    div.innerHTML = `
+      <div style="color: ${labelColor}; font-size: 10px; font-weight: 700; letter-spacing: 0.1em; margin-bottom: 2px;">${isUser ? 'YOU' : 'AI'}</div>
+      <div style="color: var(--text); white-space: pre-wrap;">${escapeHTML(text)}</div>
+    `;
+    chatHistoryEl.appendChild(div);
+    chatHistoryEl.scrollTop = chatHistoryEl.scrollHeight;
+  }
+
+  function escapeHTML(s) {
+    const div = document.createElement('div');
+    div.textContent = s;
+    return div.innerHTML;
+  }
+
+  async function sendChat() {
+    const msg = chatInputEl.value.trim();
+    if (!msg) return;
+    chatInputEl.value = '';
+    chatSendBtn.disabled = true;
+    appendChat('user', msg);
+    appendChat('ai', '...');
+    const placeholder = chatHistoryEl.lastChild;
+
+    try {
+      const res = await fetch('/api/llm/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: msg }),
+      });
+      const data = await res.json();
+      placeholder.remove();
+      if (data.error) {
+        appendChat('ai', '[error] ' + data.error);
+      } else {
+        appendChat('ai', data.answer || '(no response)');
+      }
+      if (data.stats) updateLLMStats(data.stats);
+    } catch (e) {
+      placeholder.remove();
+      appendChat('ai', '[error] ' + e.message);
+    } finally {
+      chatSendBtn.disabled = false;
+      chatInputEl.focus();
+    }
+  }
+
+  chatSendBtn.addEventListener('click', sendChat);
+  chatInputEl.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') sendChat();
+  });
+
+  analyzeBtn.addEventListener('click', async () => {
+    analyzeBtn.disabled = true;
+    analyzeBtn.textContent = 'ANALYZING…';
+    appendChat('user', '[Daily strategy reflection requested]');
+    appendChat('ai', '...');
+    const placeholder = chatHistoryEl.lastChild;
+
+    try {
+      const res = await fetch('/api/llm/analyze', { method: 'POST' });
+      const data = await res.json();
+      placeholder.remove();
+      if (data.error) {
+        appendChat('ai', '[error] ' + data.error);
+      } else {
+        appendChat('ai', data.analysis || '(no analysis)');
+      }
+      if (data.stats) updateLLMStats(data.stats);
+    } catch (e) {
+      placeholder.remove();
+      appendChat('ai', '[error] ' + e.message);
+    } finally {
+      analyzeBtn.disabled = false;
+      analyzeBtn.textContent = 'ANALYZE TRADES';
+    }
+  });
+
+  function updateLLMStats(stats) {
+    if (!stats) return;
+    const calls = stats.call_count || 0;
+    const cost = (stats.estimated_cost_usd || 0).toFixed(3);
+    document.getElementById('llm-stats').textContent = `${calls} calls · $${cost}`;
+  }
+
+  // Poll LLM stats on load
+  fetch('/api/llm/stats').then(r => r.json()).then(updateLLMStats).catch(()=>{});
 
   // Filter tabs
   document.querySelectorAll('.tab').forEach(tab => {
