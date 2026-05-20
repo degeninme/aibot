@@ -855,6 +855,23 @@ func (e *ExecutionAgent) checkPosition(mint string) {
 
 	age := time.Since(openedAt)
 
+	// ── ZOMBIE PROTECTION: force-close ANY position older than 30 min ──
+	// This is a safety net regardless of TP/SL state — prevents stuck positions
+	// from accumulating exposure forever.
+	if age > 30*time.Minute {
+		log.Printf("ExecutionAgent: ZOMBIE position %s (%v old, tp1=%v tp2=%v) — force closing\n",
+			mint, age.Truncate(time.Second), tp1Done, tp2Done)
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		txHash, err := e.sellOnPumpFun(ctx, mint, 100)
+		if err != nil {
+			log.Printf("ExecutionAgent: Zombie close failed (dropping anyway): %v\n", err)
+		}
+		e.recordSellTx(mint, txHash, pos.SolSpent)
+		e.recordOutcome(mint, "zombie_cleanup")
+		return
+	}
+
 	// ── PRICE-INDEPENDENT TIMEOUT (works even when bonding curve read fails) ──
 	// If we can't read price, still enforce timeout to avoid stuck positions
 	maxHoldMin := 5
