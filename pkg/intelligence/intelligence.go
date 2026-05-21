@@ -225,25 +225,52 @@ type TokenInfo struct {
 		Creator     string `json:"creator"`
 	} `json:"token"`
 	Pools []struct {
-		LiquidityUSD float64 `json:"liquidityUsd"`
+		LiquidityUSD flexFloat `json:"liquidityUsd"`
 		MarketCap    struct {
-			USD float64 `json:"usd"`
+			USD flexFloat `json:"usd"`
 		} `json:"marketCap"`
 		Price struct {
-			USD float64 `json:"usd"`
+			USD flexFloat `json:"usd"`
 		} `json:"price"`
 		Curve struct {
-			Progress float64 `json:"progress"` // 0-100 bonding curve progress
+			Progress flexFloat `json:"progress"` // 0-100 bonding curve progress (string or number from API)
 		} `json:"curve"`
 	} `json:"pools"`
 	Risk struct {
-		Score   float64 `json:"score"` // 1-10
+		Score   flexFloat `json:"score"` // 1-10
 		Reasons []struct {
 			Name   string `json:"name"`
 			Level  string `json:"level"`
 			Detail string `json:"description"`
 		} `json:"risks"`
 	} `json:"risk"`
+}
+
+// flexFloat handles fields that Solana Tracker returns as either string or number
+type flexFloat float64
+
+func (f *flexFloat) UnmarshalJSON(data []byte) error {
+	// Try number first
+	var n float64
+	if err := json.Unmarshal(data, &n); err == nil {
+		*f = flexFloat(n)
+		return nil
+	}
+	// Try string
+	var s string
+	if err := json.Unmarshal(data, &s); err == nil {
+		if s == "" {
+			*f = 0
+			return nil
+		}
+		var parsed float64
+		if _, err := fmt.Sscanf(s, "%f", &parsed); err == nil {
+			*f = flexFloat(parsed)
+			return nil
+		}
+	}
+	*f = 0 // fail-safe
+	return nil
 }
 
 // MetadataAssessment is the Layer 3 verdict
@@ -294,16 +321,16 @@ func (c *Client) AssessToken(ctx context.Context, mint string) *MetadataAssessme
 	result.HasTelegram = info.Token.Telegram != ""
 	result.HasWebsite = info.Token.Website != ""
 	result.HasDescription = len(info.Token.Description) > 20
-	result.RiskScore = info.Risk.Score
+	result.RiskScore = float64(info.Risk.Score)
 
 	for _, r := range info.Risk.Reasons {
 		result.RiskReasons = append(result.RiskReasons, r.Name)
 	}
 
 	if len(info.Pools) > 0 {
-		result.BondingProgress = info.Pools[0].Curve.Progress
-		result.LiquidityUSD = info.Pools[0].LiquidityUSD
-		result.MarketCapUSD = info.Pools[0].MarketCap.USD
+		result.BondingProgress = float64(info.Pools[0].Curve.Progress)
+		result.LiquidityUSD = float64(info.Pools[0].LiquidityUSD)
+		result.MarketCapUSD = float64(info.Pools[0].MarketCap.USD)
 	}
 
 	// Layer 3.1: Require at least one social link
