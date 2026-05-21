@@ -118,6 +118,44 @@
   .mode-btn.active[data-mode="live"] { background: var(--red-bg); color: var(--red); }
   .mode-btn:disabled { cursor: wait; opacity: 0.5; }
 
+  /* Control button (stop/start) */
+  .ctrl-btn {
+    font-size: 11px;
+    padding: 4px 10px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+  }
+  .ctrl-btn.running {
+    background: var(--red-bg);
+    color: var(--red);
+    border-color: var(--red);
+  }
+  .ctrl-btn.running:hover { background: var(--red); color: var(--bg); }
+  .ctrl-btn.stopped {
+    background: var(--green-bg);
+    color: var(--green);
+    border-color: var(--green);
+  }
+  .ctrl-btn.stopped:hover { background: var(--green); color: var(--bg); }
+
+  /* Paused state banner */
+  .paused-banner {
+    background: var(--amber-bg);
+    color: var(--amber);
+    padding: 12px 20px;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-align: center;
+    border-bottom: 1px solid var(--amber);
+    display: none;
+  }
+  .paused-banner.show { display: block; }
+  .paused-banner::before {
+    content: '⏸ ';
+    margin-right: 6px;
+  }
+
   main {
     display: grid;
     grid-template-columns: 320px 1fr;
@@ -372,6 +410,8 @@
       <button class="mode-btn" data-mode="live" id="btn-live">LIVE</button>
     </div>
     <div class="h-sep"></div>
+    <button class="btn ctrl-btn" id="btn-control">⏸ STOP</button>
+    <div class="h-sep"></div>
     <span>UPTIME <strong id="uptime">—</strong></span>
     <div class="h-sep"></div>
     <span>LAST UPDATE <strong id="last-update">—</strong><span class="refresh-dot" id="refresh-dot"></span></span>
@@ -379,6 +419,7 @@
 </header>
 
 <div class="error-banner" id="error-banner"></div>
+<div class="paused-banner" id="paused-banner">BOT IS STOPPED — No scanning, no API calls, no trades. Press START to resume.</div>
 
 <main>
 
@@ -607,13 +648,14 @@
   // === MAIN POLL ===
   async function poll() {
     try {
-      const [status, risk, trades, cands, wallet, mode] = await Promise.all([
+      const [status, risk, trades, cands, wallet, mode, control] = await Promise.all([
         safeFetch('/api/status'),
         safeFetch('/api/risk'),
         safeFetch('/api/trades'),
         safeFetch('/api/candidates'),
         safeFetch('/api/wallet'),
         safeFetch('/api/mode'),
+        safeFetch('/api/control'),
       ]);
 
       // Connection status — at least one must work
@@ -625,6 +667,10 @@
 
       if (mode && typeof mode.dry_run === 'boolean') {
         updateModeUI(mode.dry_run);
+      }
+
+      if (control && typeof control.paused === 'boolean') {
+        updateControlUI(control.paused);
       }
 
       if (wallet) {
@@ -839,6 +885,48 @@
 
   document.getElementById('btn-dry').addEventListener('click', () => setMode('dry'));
   document.getElementById('btn-live').addEventListener('click', () => setMode('live'));
+
+  // === STOP / START CONTROL ===
+  function updateControlUI(isPaused) {
+    const btn = document.getElementById('btn-control');
+    const banner = document.getElementById('paused-banner');
+    if (isPaused) {
+      btn.textContent = '▶ START';
+      btn.classList.remove('running');
+      btn.classList.add('stopped');
+      banner.classList.add('show');
+    } else {
+      btn.textContent = '⏸ STOP';
+      btn.classList.remove('stopped');
+      btn.classList.add('running');
+      banner.classList.remove('show');
+    }
+  }
+
+  async function toggleControl() {
+    const btn = document.getElementById('btn-control');
+    const willStop = btn.classList.contains('running');
+
+    if (willStop) {
+      if (!confirm('Stop the bot?\n\nNo scanning, no API calls, no trades while stopped.\nYou can resume anytime.')) return;
+    }
+
+    btn.disabled = true;
+    const data = await safeFetch('/api/control', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ action: willStop ? 'stop' : 'start' })
+    });
+
+    if (data && typeof data.paused === 'boolean') {
+      updateControlUI(data.paused);
+    } else {
+      showError('Failed to ' + (willStop ? 'stop' : 'start') + ' bot');
+    }
+    btn.disabled = false;
+  }
+
+  document.getElementById('btn-control').addEventListener('click', toggleControl);
 
   // === RESET BUTTON ===
   document.getElementById('reset-exposure-btn').addEventListener('click', async () => {
