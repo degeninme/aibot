@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mumugogoing/meme_bot/pkg/agents/execution"
@@ -42,8 +44,30 @@ type Orchestrator struct {
 	llm       *llm.Client
 	intel     *intelligence.Client
 	
+	// Runtime pause flag (true = bot is paused, no scanning/processing)
+	paused   atomicBool
+	pausedAt time.Time
+	pauseMu  sync.RWMutex
+	
 	ctx    context.Context
 	cancel context.CancelFunc
+}
+
+// atomicBool is a simple wrapper for atomic bool ops
+type atomicBool struct {
+	v int32
+}
+
+func (a *atomicBool) Set(b bool) {
+	if b {
+		atomic.StoreInt32(&a.v, 1)
+	} else {
+		atomic.StoreInt32(&a.v, 0)
+	}
+}
+
+func (a *atomicBool) Get() bool {
+	return atomic.LoadInt32(&a.v) == 1
 }
 
 // NewOrchestrator creates a new orchestrator
@@ -99,6 +123,9 @@ func (o *Orchestrator) Start() {
 	log.Println("Orchestrator: Starting meme coin trading bot...")
 	log.Printf("Orchestrator: DryRun=%v, AutoExecute=%v\n", o.config.DryRun, o.config.AutoExecute)
 	
+	// Wire pause check to scanner so it skips scans when paused (saves RPC)
+	o.scanner.SetPauseCheck(o.IsPaused)
+	
 	// Start periodic telemetry logging
 	telemetryStop := o.telemetry.StartPeriodicLogging(30 * time.Second)
 	defer close(telemetryStop)
@@ -123,6 +150,46 @@ func (o *Orchestrator) Stop() {
 	o.cancel()
 }
 
+// Pause temporarily halts all bot activity (no scanning, no API calls, no trades)
+// The bot keeps running but processes no work until Resume() is called.
+func (o *Orchestrator) Pause() {
+	if o.paused.Get() {
+		return
+	}
+	o.pauseMu.Lock()
+	o.pausedAt = time.Now()
+	o.pauseMu.Unlock()
+	o.paused.Set(true)
+	log.Println("Orchestrator: ⏸  PAUSED — bot will skip all scanning and processing")
+}
+
+// Resume unpauses the bot
+func (o *Orchestrator) Resume() {
+	if !o.paused.Get() {
+		return
+	}
+	o.pauseMu.RLock()
+	pausedDuration := time.Since(o.pausedAt)
+	o.pauseMu.RUnlock()
+	o.paused.Set(false)
+	log.Printf("Orchestrator: ▶  RESUMED after %v paused\n", pausedDuration.Truncate(time.Second))
+}
+
+// IsPaused returns true if the bot is currently paused
+func (o *Orchestrator) IsPaused() bool {
+	return o.paused.Get()
+}
+
+// PausedSince returns the time the bot was paused (zero time if not paused)
+func (o *Orchestrator) PausedSince() time.Time {
+	o.pauseMu.RLock()
+	defer o.pauseMu.RUnlock()
+	if !o.paused.Get() {
+		return time.Time{}
+	}
+	return o.pausedAt
+}
+
 // processTokens processes discovered tokens through the pipeline
 func (o *Orchestrator) processTokens() {
 	log.Println("Orchestrator: Token processing pipeline started")
@@ -139,6 +206,11 @@ func (o *Orchestrator) processTokens() {
 
 // processToken processes a single token through the entire pipeline
 func (o *Orchestrator) processToken(token models.TokenFound) {
+	// Pause gate — bail out immediately if paused (saves all downstream API calls)
+	if o.paused.Get() {
+		return
+	}
+
 	startTime := time.Now()
 	
 	log.Printf("Orchestrator: Processing token %s on %s\n", token.TokenAddress, token.Chain)
@@ -224,6 +296,13 @@ func (o *Orchestrator) processExecutions() {
 
 // executeCandidate executes a trade for a candidate
 func (o *Orchestrator) executeCandidate(candidate *models.CandidateToken) {
+	// Pause gate — even if a candidate slipped through, don't execute when paused
+	if o.paused.Get() {
+		log.Printf("Orchestrator: Skipping execution of %s — bot is paused\n",
+			candidate.Token.TokenAddress)
+		return
+	}
+
 	startTime := time.Now()
 	
 	log.Printf("Orchestrator: Executing candidate %s\n", candidate.Token.TokenAddress)
