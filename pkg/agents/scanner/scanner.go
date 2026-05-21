@@ -104,6 +104,7 @@ type ChainScannerAgent struct {
 	seenMints    map[string]bool
 	seenMintsMu  sync.Mutex
 	heliusAPIKey string
+	pauseCheck   func() bool // returns true → skip current scan
 }
 
 func NewChainScannerAgent(cfg *config.Config) *ChainScannerAgent {
@@ -169,9 +170,19 @@ func (s *ChainScannerAgent) scanSolana() {
 		case <-s.ctx.Done():
 			return
 		case <-ticker.C:
+			// Skip if paused (saves RPC calls)
+			if s.pauseCheck != nil && s.pauseCheck() {
+				continue
+			}
 			s.scanSolanaNewTokens()
 		}
 	}
+}
+
+// SetPauseCheck wires up a function the scanner calls before each scan.
+// If the function returns true, the scan is skipped.
+func (s *ChainScannerAgent) SetPauseCheck(fn func() bool) {
+	s.pauseCheck = fn
 }
 
 func (s *ChainScannerAgent) scanBase() {
