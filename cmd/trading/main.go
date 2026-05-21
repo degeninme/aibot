@@ -50,6 +50,8 @@ func startAPIServer(cfg *config.Config) {
 	router.HandleFunc("/api/mode", modeHandler).Methods("GET")
 	router.HandleFunc("/api/mode", setModeHandler).Methods("POST")
 	router.HandleFunc("/api/risk/reset", resetExposureHandler).Methods("POST")
+	router.HandleFunc("/api/control", controlGetHandler).Methods("GET")
+	router.HandleFunc("/api/control", controlSetHandler).Methods("POST")
 	router.HandleFunc("/api/llm/analyze", llmAnalyzeHandler).Methods("POST")
 	router.HandleFunc("/api/llm/chat", llmChatHandler).Methods("POST")
 	router.HandleFunc("/api/llm/stats", llmStatsHandler).Methods("GET")
@@ -406,4 +408,61 @@ func intelStatsHandler(w http.ResponseWriter, r *http.Request) {
 		"enabled":    intel.Enabled(),
 		"call_count": intel.CallCount(),
 	})
+}
+
+// controlGetHandler returns the bot's current run/pause state
+func controlGetHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	paused := orch.IsPaused()
+	pausedSince := orch.PausedSince()
+	resp := map[string]interface{}{
+		"paused": paused,
+		"state":  ternary(paused, "stopped", "running"),
+	}
+	if !pausedSince.IsZero() {
+		resp["paused_since"] = pausedSince.Format(time.RFC3339)
+		resp["paused_duration_sec"] = int(time.Since(pausedSince).Seconds())
+	}
+	json.NewEncoder(w).Encode(resp)
+}
+
+// controlSetHandler accepts {"action": "stop" | "start"} and toggles the bot
+func controlSetHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+	var body struct {
+		Action string `json:"action"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "invalid body"})
+		return
+	}
+
+	action := strings.ToLower(body.Action)
+	switch action {
+	case "stop", "pause":
+		orch.Pause()
+	case "start", "resume":
+		orch.Resume()
+	default:
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "action must be stop/start"})
+		return
+	}
+
+	paused := orch.IsPaused()
+	log.Printf("MainAPI: Bot control changed to %s (paused=%v)\n", action, paused)
+	json.NewEncoder(w).Encode(map[string]interface{}{
+		"status": "ok",
+		"action": action,
+		"paused": paused,
+		"state":  ternary(paused, "stopped", "running"),
+	})
+}
+
+func ternary(cond bool, a, b string) string {
+	if cond {
+		return a
+	}
+	return b
 }
