@@ -1,6 +1,7 @@
 package strategy
 
 import (
+	"fmt"
 	"log"
 	"math"
 	"math/rand"
@@ -51,34 +52,39 @@ func (s *StrategyEvaluatorAgent) Evaluate(
 ) (*models.StrategyDecision, error) {
 	log.Printf("StrategyEvaluatorAgent: Evaluating token %s\n", token.Token.TokenAddress)
 
+	// AGE CHECK: Skip tokens older than 45 seconds
+	tokenAge := time.Since(time.Unix(token.Token.FirstSeenTS, 0))
+	if tokenAge > 45*time.Second {
+		log.Printf("StrategyEvaluatorAgent: Token %s too old (%.0fs) - skipping\n", 
+			token.Token.TokenAddress[:10], tokenAge.Seconds())
+		return &models.StrategyDecision{
+			TokenAddress:   token.Token.TokenAddress,
+			Chain:          token.Token.Chain,
+			WinProbability: 0,
+			Action:         "skip",
+			Rationale:      []string{fmt.Sprintf("token too old: %.0fs", tokenAge.Seconds())},
+			EvaluatedAt:    time.Now(),
+		}, nil
+	}
+
 	decision := &models.StrategyDecision{
 		TokenAddress: token.Token.TokenAddress,
 		Chain:        token.Token.Chain,
 		EvaluatedAt:  time.Now(),
 		Rationale:    []string{},
 	}
-func (s *StrategyEvaluatorAgent) Evaluate(
-    safety *models.SafetyReport,
-    offchain *models.OffChainMetrics,
-    token models.PreFilteredToken,
-) (*models.StrategyDecision, error) {
-    
-    // Add this age check
-    tokenAge := time.Since(time.Unix(token.Token.FirstSeenTS, 0))
-    if tokenAge > 45*time.Second {
-        return &models.StrategyDecision{
-            TokenAddress: token.Token.TokenAddress,
-            Chain:        token.Token.Chain,
-            Action:       "skip",
-            WinProbability: 0,
-            Rationale:    []string{fmt.Sprintf("token too old: %.0fs", tokenAge.Seconds())},
-            EvaluatedAt:  time.Now(),
-        }, nil
-    }
-    
-    // Rest of your existing Evaluate code...
-}
-		token.Token.TokenAddress, decision.WinProbability, decision.Action, decision.Confidence)
+
+	decision.WinProbability = s.calculateWinProbability(safety, offchain, token)
+	decision.ExpectedROI, decision.ExpectedROIStd = s.calculateExpectedROI(offchain, token)
+	decision.Confidence = s.determineConfidence(safety, decision.WinProbability)
+	decision.Action = s.determineAction(decision)
+	decision.SuggestedAmountUSD = s.calculatePositionSize(decision)
+	decision.StopLossPct = s.calculateStopLoss(decision)
+	decision.TakeProfitPct = s.calculateTakeProfit(decision)
+	decision.TimeHorizonMinutes = s.calculateTimeHorizon(decision)
+
+	log.Printf("StrategyEvaluatorAgent: Token %s - WinProb: %.2f, Action: %s, Confidence: %s, Size: $%.2f\n",
+		token.Token.TokenAddress[:10], decision.WinProbability, decision.Action, decision.Confidence, decision.SuggestedAmountUSD)
 
 	return decision, nil
 }
@@ -86,76 +92,59 @@ func (s *StrategyEvaluatorAgent) Evaluate(
 func (s *StrategyEvaluatorAgent) calculateWinProbability(
 	safety *models.SafetyReport,
 	offchain *models.OffChainMetrics,
-func (s *StrategyEvaluatorAgent) calculateWinProbability(
-    safety *models.SafetyReport,
-    offchain *models.OffChainMetrics,
-    token models.PreFilteredToken,
+	token models.PreFilteredToken,
 ) float64 {
-    if !safety.CanBuy || !safety.CanSell {
-        return 0.0
-    }
-    
-    // Start lower - new tokens are inherently risky
-    baseProb := 0.45
-    
-    // Dev check results (you need to add this to your SafetyReport or pass separately)
-    // For now, use token.Priority as proxy
-    if token.Priority == "high" {
-        baseProb += 0.10  // Dev holds reasonable amount (2-5%)
-    } else if token.Priority == "low" {
-        baseProb -= 0.15  // Dev sold or holds too much
-    }
-    
-    // Safety bonuses (these actually matter)
-    if safety.HoneypotScore < 0.05 {
-        baseProb += 0.15
-    } else if safety.HoneypotScore > 0.15 {
-        baseProb -= 0.20
-    }
-    
-    if safety.LiquidityLocked {
-        baseProb += 0.10
-    }
-    
-    if safety.OwnerControls.Renounced {
-        baseProb += 0.08
-    }
-    
-    if !safety.OwnerControls.HasBlacklist && !safety.OwnerControls.HasTransferHook {
-        baseProb += 0.05
-    }
-    
-    // Volume - only relevant if token has traded
-    if offchain.Volume24hDEX > 50000 {
-        baseProb += 0.08
-    } else if offchain.Volume24hDEX > 10000 {
-        baseProb += 0.04
-    }
-    
-    // Social signals (low threshold for new tokens)
-    totalMentions := 0
-    for _, count := range offchain.SocialMentions {
-        totalMentions += count
-    }
-    if totalMentions > 10 {
-        baseProb += 0.06
-    }
-    
-    // PumpFun source bonus
-    if token.Token.Metadata["source"] == "pumpfun" {
-        baseProb += 0.05
-    }
-    
-    // Cap at realistic levels
-    if baseProb > 0.82 {
-        baseProb = 0.82
-    }
-    if baseProb < 0.0 {
-        baseProb = 0.0
-    }
-    
-    return baseProb
-}
+	// Cannot trade at all = 0
+	if !safety.CanBuy || !safety.CanSell {
+		return 0.0
+	}
+
+	// Start lower - new tokens are inherently risky
+	baseProb := 0.45
+
+	// Priority from scanner (based on dev holdings)
+	switch token.Priority {
+	case "high":
+		baseProb += 0.10 // Dev holds reasonable amount (2-6%)
+	case "low":
+		baseProb -= 0.15 // Dev sold or holds too much
+	}
+
+	// Safety bonuses (these actually matter)
+	if safety.HoneypotScore < 0.05 {
+		baseProb += 0.15
+	} else if safety.HoneypotScore > 0.15 {
+		baseProb -= 0.20
+	}
+
+	if safety.LiquidityLocked {
+		baseProb += 0.10
+	}
+
+	if safety.OwnerControls.Renounced {
+		baseProb += 0.08
+	}
+
+	if !safety.OwnerControls.HasBlacklist && !safety.OwnerControls.HasTransferHook {
+		baseProb += 0.05
+	}
+
+	// Volume bonus (only if token has traded)
+	if offchain.Volume24hDEX > 50000 {
+		baseProb += 0.08
+	} else if offchain.Volume24hDEX > 10000 {
+		baseProb += 0.04
+	}
+
+	// Social signals (low threshold for new tokens)
+	totalMentions := 0
+	for _, count := range offchain.SocialMentions {
+		totalMentions += count
+	}
+	if totalMentions > 10 {
+		baseProb += 0.06
+	}
+
 	// Velocity
 	switch offchain.Velocity {
 	case "rising":
@@ -163,97 +152,52 @@ func (s *StrategyEvaluatorAgent) calculateWinProbability(
 	case "falling":
 		baseProb -= 0.05
 	}
-	// "stable" or "" (unknown for brand-new tokens) = no change
-
-	// Priority
-	switch token.Priority {
-	case "high":
-		baseProb += 0.05
-	case "low":
-		baseProb -= 0.03
-	}
 
 	// PumpFun source bonus
 	if token.Token.Metadata["source"] == "pumpfun" {
-		baseProb += 0.02
+		baseProb += 0.05
 	}
 
-	if baseProb > 1.0 {
-		baseProb = 1.0
+	// Cap at realistic levels
+	if baseProb > 0.85 {
+		baseProb = 0.85
 	}
 	if baseProb < 0.0 {
 		baseProb = 0.0
-	func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.StrategyDecision) float64 {
-    s.config.ApplyOverrides()
-    
-    balance := s.liveBalance()
-    if s.config.DryRun {
-        balance = 500.0
-    }
-    
-    const reserveUSD = 5.0
-    available := balance - reserveUSD
-    if available <= 1.0 {
-        return 0
-    }
-    
-    maxPosition := available * s.config.SinglePositionPct
-    
-    // Scale by confidence (no random jitter)
-    multiplier := 1.0
-    switch decision.Confidence {
-    case "high":
-      func (s *StrategyEvaluatorAgent) calculateStopLoss(decision *models.StrategyDecision) float64 {
-    // Higher confidence = tighter stop loss
-    switch decision.Confidence {
-    case "high":
-        return 0.08 // 8% stop
-    case "medium":
-        return 0.12 // 12% stop
-    }
-    return 0.18 // 18% stop for low confidence
+	}
+	return baseProb
 }
 
-func (s *StrategyEvaluatorAgent) calculateTakeProfit(decision *models.StrategyDecision) float64 {
-    // Scale by win probability
-    baseTP := 0.25
-    if decision.WinProbability > 0.75 {
-        baseTP = 0.40
-    } else if decision.WinProbability > 0.65 {
-        baseTP = 0.30
-    }
-    
-    if baseTP > 0.60 {
-        baseTP = 0.60
-    }
-    return math.Round(baseTP*100) / 100
+func (s *StrategyEvaluatorAgent) calculateExpectedROI(
+	offchain *models.OffChainMetrics,
+	token models.PreFilteredToken,
+) (float64, float64) {
+	baseROI := 0.25
+	if offchain.Volume24hDEX > s.config.MinVolumeDEX*2 {
+		baseROI += 0.10
+	}
+	if token.Token.InitialLiquidity.ReserveNative > 0 {
+		baseROI += 0.05
+	}
+	if offchain.Velocity == "rising" {
+		baseROI += 0.10
+	}
+	
+	// Cap ROI
+	if baseROI > 0.60 {
+		baseROI = 0.60
+	}
+	return baseROI, 0.30
 }
-    if tokenAge > 45*time.Second {
-        return &models.StrategyDecision{
-            TokenAddress: token.Token.TokenAddress,
-            Chain:        token.Token.Chain,
-            Action:       "skip",
-            WinProbability: 0,
-            Rationale:    []string{fmt.Sprintf("token too old: %.0fs", tokenAge.Seconds())},
-            EvaluatedAt:  time.Now(),
-        }, nil
-    }
-    
-    // Rest of your existing Evaluate code...
-}
-    if suggested < 1.0 {
-        suggested = 1.0
-    }
-    if suggested > available {
-        suggested = available
-    }
-    
-    return math.Round(suggested*100) / 100
-}
-	if winProb >= 0.82 && safety.HoneypotScore < 0.1 {
+
+func (s *StrategyEvaluatorAgent) determineConfidence(
+	safety *models.SafetyReport,
+	winProb float64,
+) string {
+	if winProb >= 0.75 && safety.HoneypotScore < 0.08 {
 		return "high"
 	}
-	if winProb >= 0.70 && safety.HoneypotScore < 0.2 {
+	if winProb >= 0.60 && safety.HoneypotScore < 0.15 {
 		return "medium"
 	}
 	return "low"
@@ -267,7 +211,7 @@ func (s *StrategyEvaluatorAgent) determineAction(decision *models.StrategyDecisi
 		}
 		return "list"
 	}
-	if decision.WinProbability >= 0.60 {
+	if decision.WinProbability >= 0.50 {
 		return "monitor"
 	}
 	return "skip"
@@ -283,40 +227,44 @@ func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.Strategy
 		balance = 500.0 // simulated capital for paper trading
 	}
 
-	// Reserve some SOL for transaction fees & rent
-	const reserveUSD = 2.0
+	// Reserve SOL for transaction fees & rent
+	const reserveUSD = 5.0
 
 	available := balance - reserveUSD
-	if available <= 0.5 {
+	if available <= 1.0 {
 		log.Printf("StrategyEvaluatorAgent: Balance too low ($%.2f, reserve=$%.2f) — skipping\n",
 			balance, reserveUSD)
 		return 0
 	}
 
-	// Cap by single position percentage
+	// Base position size from config
 	maxPosition := available * s.config.SinglePositionPct
-	if maxPosition > available {
-		maxPosition = available
-	}
 
-	// Apply confidence multiplier
-	multiplier := 1.0
+	// Scale by confidence (no random jitter)
+	confidenceMultiplier := 1.0
 	switch decision.Confidence {
+	case "high":
+		confidenceMultiplier = 1.0
 	case "medium":
-		multiplier = 0.7
+		confidenceMultiplier = 0.7
 	case "low":
-		multiplier = 0.4
+		confidenceMultiplier = 0.4
 	}
 
-	target := maxPosition * multiplier
+	// Additional scaling by win probability relative to threshold
+	probRatio := decision.WinProbability / s.config.WinProbabilityThreshold
+	if probRatio > 1.2 {
+		probRatio = 1.2
+	}
+	if probRatio < 0.5 {
+		probRatio = 0.5
+	}
 
-	// Randomize 70-100% of target to vary entry sizes (helps with diversification)
-	jitter := 0.7 + rand.Float64()*0.3
-	suggested := target * jitter
+	suggested := maxPosition * confidenceMultiplier * probRatio
 
-	// Floor at $0.50 to avoid dust trades that don't cover fees
-	if suggested < 0.5 {
-		suggested = 0.5
+	// Minimum size to cover fees
+	if suggested < 1.0 {
+		suggested = 1.0
 	}
 
 	// Don't suggest more than what's available
@@ -325,28 +273,34 @@ func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.Strategy
 	}
 
 	rounded := math.Round(suggested*100) / 100
-	log.Printf("StrategyEvaluatorAgent: Position size — balance=$%.2f available=$%.2f maxPos=$%.2f → $%.2f\n",
-		balance, available, maxPosition, rounded)
+	log.Printf("StrategyEvaluatorAgent: Position size — balance=$%.2f available=$%.2f maxPos=$%.2f → $%.2f (conf=%s, prob=%.2f)\n",
+		balance, available, maxPosition, rounded, decision.Confidence, decision.WinProbability)
 	return rounded
 }
 
 func (s *StrategyEvaluatorAgent) calculateStopLoss(decision *models.StrategyDecision) float64 {
+	// Higher confidence = tighter stop loss (protect gains)
 	switch decision.Confidence {
 	case "high":
-		return 0.20
+		return 0.08 // 8% stop loss
 	case "medium":
-		return 0.15
+		return 0.12 // 12% stop loss
 	}
-	return 0.10
+	return 0.18 // 18% stop loss for low confidence (avoid noise)
 }
 
 func (s *StrategyEvaluatorAgent) calculateTakeProfit(decision *models.StrategyDecision) float64 {
-	baseTP := decision.ExpectedROI * 1.5
-	if baseTP < 0.20 {
-		baseTP = 0.20
+	// Scale by win probability
+	baseTP := 0.25
+	if decision.WinProbability > 0.75 {
+		baseTP = 0.40
+	} else if decision.WinProbability > 0.65 {
+		baseTP = 0.30
 	}
-	if baseTP > 1.00 {
-		baseTP = 1.00
+	
+	// Cap at reasonable levels
+	if baseTP > 0.60 {
+		baseTP = 0.60
 	}
 	return math.Round(baseTP*100) / 100
 }
@@ -356,7 +310,7 @@ func (s *StrategyEvaluatorAgent) calculateTimeHorizon(decision *models.StrategyD
 	case "high":
 		return 60
 	case "medium":
-		return 30
+		return 45
 	}
-	return 15
+	return 30
 }
