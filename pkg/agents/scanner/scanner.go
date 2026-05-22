@@ -678,4 +678,219 @@ func (s *ChainScannerAgent) checkDevWallet(mint, creator string) devCheckResult 
 
 	// Detect dev sell: bonding curve has activity (mint has trades) but dev holds 0
 	if devBalance == 0 {
-		log.Printf("ChainScannerAgent: 🚫 Dev SOLD %
+		log.Printf("ChainScannerAgent: 🚫 Dev SOLD %s — dev wallet %s holds 0 tokens (decimals=%d, supply=%d)\n",
+			mint[:10], creator[:10], decimals, supply)
+		return devCheckResult{
+			skip:       true,
+			reason:     "dev_already_sold",
+			devBalance: devBalance,
+			supply:     supply,
+			devPct:     pct,
+		}
+	}
+
+	// Reject if dev holds > 8% (configurable via DEV_MAX_PCT env var, default 8%)
+	maxDevPct := 8.0 // Changed from 5.0 to 8.0
+	if envVal := os.Getenv("DEV_MAX_PCT"); envVal != "" {
+		var v float64
+		fmt.Sscanf(envVal, "%f", &v)
+		if v > 0 {
+			maxDevPct = v
+		}
+	}
+	if pct > maxDevPct {
+		log.Printf("ChainScannerAgent: 🚫 Dev holds too much (%.2f%% > %.2f%%) — skipping %s\n",
+			pct, maxDevPct, mint[:10])
+		return devCheckResult{
+			skip:       true,
+			reason:     "dev_holds_too_much",
+			devBalance: devBalance,
+			supply:     supply,
+			devPct:     pct,
+		}
+	}
+
+	log.Printf("ChainScannerAgent: ✓ Dev check passed for %s — dev holds %.2f%% (%d tokens)\n",
+		mint[:10], pct, devBalance)
+	return devCheckResult{
+		skip:       false,
+		devBalance: devBalance,
+		supply:     supply,
+		devPct:     pct,
+	}
+}
+
+// fetchTokenBalance returns the balance the given owner has of a specific mint
+func (s *ChainScannerAgent) fetchTokenBalance(owner, mint string) (uint64, uint8, error) {
+	resp, err := s.rpcCall("getTokenAccountsByOwner", []interface{}{
+		owner,
+		map[string]string{"mint": mint},
+		map[string]string{"encoding": "jsonParsed"},
+	})
+	if err != nil {
+		return 0, 0, err
+	}
+	var out struct {
+		Value []struct {
+			Account struct {
+				Data struct {
+					Parsed struct {
+						Info struct {
+							TokenAmount struct {
+								Amount   string `json:"amount"`
+								Decimals uint8  `json:"decimals"`
+							} `json:"tokenAmount"`
+						} `json:"info"`
+					} `json:"parsed"`
+				} `json:"data"`
+			} `json:"account"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return 0, 0, err
+	}
+	if len(out.Value) == 0 {
+		return 0, 6, nil // PumpFun uses 6 decimals
+	}
+	amtStr := out.Value[0].Account.Data.Parsed.Info.TokenAmount.Amount
+	decimals := out.Value[0].Account.Data.Parsed.Info.TokenAmount.Decimals
+	var amt uint64
+	fmt.Sscanf(amtStr, "%d", &amt)
+	return amt, decimals, nil
+}
+
+// fetchMintSupply returns the total supply of a mint
+func (s *ChainScannerAgent) fetchMintSupply(mint string) (uint64, error) {
+	resp, err := s.rpcCall("getTokenSupply", []interface{}{
+		mint,
+		map[string]string{"commitment": "confirmed"},
+	})
+	if err != nil {
+		return 0, err
+	}
+	var out struct {
+		Value struct {
+			Amount   string `json:"amount"`
+			Decimals uint8  `json:"decimals"`
+		} `json:"value"`
+	}
+	if err := json.Unmarshal(resp.Result, &out); err != nil {
+		return 0, err
+	}
+	var supply uint64
+	fmt.Sscanf(out.Value.Amount, "%d", &supply)
+	return supply, nil
+}
+
+func (s *ChainScannerAgent) emitTokenFound(token models.TokenFound) {
+	s.emitTokenFoundWithPriority(token, "medium")
+}
+
+func (s *ChainScannerAgent) emitTokenFoundWithPriority(token models.TokenFound, priority string) {
+	// Enrich with metadata from PumpFun API (best-effort, non-blocking)
+	s.enrichTokenMetadata(&token)
+
+	// Create PreFilteredToken with priority
+	preFiltered := models.PreFilteredToken{
+		Token:    token,
+		Priority: priority,
+		Dropped:  false,
+		Reasons:  []string{},
+	}
+
+	select {
+	case s.tokenChannel <- preFiltered.Token:
+		log.Printf("ChainScannerAgent: Token emitted - %s (priority=%s)\n", token.TokenAddress[:10], priority)
+	case <-s.ctx.Done():
+		return
+	default:
+		log.Println("ChainScannerAgent: Warning - token channel full, dropping event")
+	}
+}
+
+// enrichTokenMetadata fetches name/symbol/description from PumpFun's public API.
+// Best effort — silently fails if API is slow or returns nothing.
+func (s *ChainScannerAgent) enrichTokenMetadata(token *models.TokenFound) {
+	if token.Metadata == nil {
+		token.Metadata = make(map[string]string)
+	}
+
+	ctx, cancel := context.WithTimeout(s.ctx, 1500*time.Millisecond)
+	defer cancel()
+
+	url := fmt.Sprintf("https://frontend-api.pump.fun/coins/%s", token.TokenAddress)
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (compatible; PumpBot/1.0)")
+	req.Header.Set("Accept", "application/json")
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != 200 {
+		return
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return
+	}
+
+	var meta struct {
+		Name         string `json:"name"`
+		Symbol       string `json:"symbol"`
+		Description  string `json:"description"`
+		ImageURI     string `json:"image_uri"`
+		Twitter      string `json:"twitter"`
+		Telegram     string `json:"telegram"`
+		Website      string `json:"website"`
+		Creator      string `json:"creator"`
+		MarketCapSOL float64 `json:"market_cap"`
+		USDMarketCap float64 `json:"usd_market_cap"`
+	}
+	if err := json.Unmarshal(body, &meta); err != nil {
+		return
+	}
+
+	if meta.Name != "" {
+		token.Metadata["name"] = meta.Name
+	}
+	if meta.Symbol != "" {
+		token.Metadata["symbol"] = meta.Symbol
+	}
+	if meta.Description != "" {
+		// Truncate to keep prompt size sane
+		desc := meta.Description
+		if len(desc) > 500 {
+			desc = desc[:500] + "..."
+		}
+		token.Metadata["description"] = desc
+	}
+	if meta.Twitter != "" {
+		token.Metadata["twitter"] = meta.Twitter
+	}
+	if meta.Telegram != "" {
+		token.Metadata["telegram"] = meta.Telegram
+	}
+	if meta.Website != "" {
+		token.Metadata["website"] = meta.Website
+	}
+	if meta.USDMarketCap > 0 {
+		token.Metadata["usd_market_cap"] = fmt.Sprintf("%.2f", meta.USDMarketCap)
+	}
+
+	if meta.Name != "" || meta.Symbol != "" {
+		log.Printf("ChainScannerAgent: Enriched %s: name=%q symbol=%q\n",
+			token.TokenAddress[:10], meta.Name, meta.Symbol)
+	}
+}
+
+// base64Decode kept for compatibility with other modules that may reference it
+func base64Decode(s string) ([]byte, error) {
+	return base64.StdEncoding.DecodeString(s)
+}
