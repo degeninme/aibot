@@ -57,17 +57,27 @@ func (s *StrategyEvaluatorAgent) Evaluate(
 		EvaluatedAt:  time.Now(),
 		Rationale:    []string{},
 	}
-
-	decision.WinProbability = s.calculateWinProbability(safety, offchain, token)
-	decision.ExpectedROI, decision.ExpectedROIStd = s.calculateExpectedROI(offchain, token)
-	decision.Confidence = s.determineConfidence(safety, decision.WinProbability)
-	decision.Action = s.determineAction(decision)
-	decision.SuggestedAmountUSD = s.calculatePositionSize(decision)
-	decision.StopLossPct = s.calculateStopLoss(decision)
-	decision.TakeProfitPct = s.calculateTakeProfit(decision)
-	decision.TimeHorizonMinutes = s.calculateTimeHorizon(decision)
-
-	log.Printf("StrategyEvaluatorAgent: Token %s - WinProb: %.2f, Action: %s, Confidence: %s\n",
+func (s *StrategyEvaluatorAgent) Evaluate(
+    safety *models.SafetyReport,
+    offchain *models.OffChainMetrics,
+    token models.PreFilteredToken,
+) (*models.StrategyDecision, error) {
+    
+    // Add this age check
+    tokenAge := time.Since(time.Unix(token.Token.FirstSeenTS, 0))
+    if tokenAge > 45*time.Second {
+        return &models.StrategyDecision{
+            TokenAddress: token.Token.TokenAddress,
+            Chain:        token.Token.Chain,
+            Action:       "skip",
+            WinProbability: 0,
+            Rationale:    []string{fmt.Sprintf("token too old: %.0fs", tokenAge.Seconds())},
+            EvaluatedAt:  time.Now(),
+        }, nil
+    }
+    
+    // Rest of your existing Evaluate code...
+}
 		token.Token.TokenAddress, decision.WinProbability, decision.Action, decision.Confidence)
 
 	return decision, nil
@@ -173,31 +183,73 @@ func (s *StrategyEvaluatorAgent) calculateWinProbability(
 	}
 	if baseProb < 0.0 {
 		baseProb = 0.0
-	}
-	return baseProb
+	func (s *StrategyEvaluatorAgent) calculatePositionSize(decision *models.StrategyDecision) float64 {
+    s.config.ApplyOverrides()
+    
+    balance := s.liveBalance()
+    if s.config.DryRun {
+        balance = 500.0
+    }
+    
+    const reserveUSD = 5.0
+    available := balance - reserveUSD
+    if available <= 1.0 {
+        return 0
+    }
+    
+    maxPosition := available * s.config.SinglePositionPct
+    
+    // Scale by confidence (no random jitter)
+    multiplier := 1.0
+    switch decision.Confidence {
+    case "high":
+      func (s *StrategyEvaluatorAgent) calculateStopLoss(decision *models.StrategyDecision) float64 {
+    // Higher confidence = tighter stop loss
+    switch decision.Confidence {
+    case "high":
+        return 0.08 // 8% stop
+    case "medium":
+        return 0.12 // 12% stop
+    }
+    return 0.18 // 18% stop for low confidence
 }
 
-func (s *StrategyEvaluatorAgent) calculateExpectedROI(
-	offchain *models.OffChainMetrics,
-	token models.PreFilteredToken,
-) (float64, float64) {
-	baseROI := 0.20
-	if offchain.Volume24hDEX > s.config.MinVolumeDEX*2 {
-		baseROI += 0.10
-	}
-	if token.Token.InitialLiquidity.ReserveNative > 0 {
-		baseROI += 0.05
-	}
-	if offchain.Velocity == "rising" {
-		baseROI += 0.10
-	}
-	return baseROI, 0.30
+func (s *StrategyEvaluatorAgent) calculateTakeProfit(decision *models.StrategyDecision) float64 {
+    // Scale by win probability
+    baseTP := 0.25
+    if decision.WinProbability > 0.75 {
+        baseTP = 0.40
+    } else if decision.WinProbability > 0.65 {
+        baseTP = 0.30
+    }
+    
+    if baseTP > 0.60 {
+        baseTP = 0.60
+    }
+    return math.Round(baseTP*100) / 100
 }
-
-func (s *StrategyEvaluatorAgent) determineConfidence(
-	safety *models.SafetyReport,
-	winProb float64,
-) string {
+    if tokenAge > 45*time.Second {
+        return &models.StrategyDecision{
+            TokenAddress: token.Token.TokenAddress,
+            Chain:        token.Token.Chain,
+            Action:       "skip",
+            WinProbability: 0,
+            Rationale:    []string{fmt.Sprintf("token too old: %.0fs", tokenAge.Seconds())},
+            EvaluatedAt:  time.Now(),
+        }, nil
+    }
+    
+    // Rest of your existing Evaluate code...
+}
+    if suggested < 1.0 {
+        suggested = 1.0
+    }
+    if suggested > available {
+        suggested = available
+    }
+    
+    return math.Round(suggested*100) / 100
+}
 	if winProb >= 0.82 && safety.HoneypotScore < 0.1 {
 		return "high"
 	}
