@@ -76,49 +76,76 @@ func (s *StrategyEvaluatorAgent) Evaluate(
 func (s *StrategyEvaluatorAgent) calculateWinProbability(
 	safety *models.SafetyReport,
 	offchain *models.OffChainMetrics,
-	token models.PreFilteredToken,
+func (s *StrategyEvaluatorAgent) calculateWinProbability(
+    safety *models.SafetyReport,
+    offchain *models.OffChainMetrics,
+    token models.PreFilteredToken,
 ) float64 {
-	// Cannot trade at all = 0
-	if !safety.CanBuy || !safety.CanSell {
-		return 0.0
-	}
-
-	// Higher base for new PumpFun tokens — they have 0 volume/social by nature
-	baseProb := 0.65
-
-	// Safety bonuses
-	if safety.HoneypotScore < 0.1 {
-		baseProb += 0.08
-	} else if safety.HoneypotScore > s.config.MaxHoneypotScore {
-		baseProb -= 0.15
-	}
-
-	if safety.LiquidityLocked {
-		baseProb += 0.07
-	}
-
-	if safety.OwnerControls.Renounced {
-		baseProb += 0.06
-	}
-
-	if !safety.OwnerControls.HasBlacklist && !safety.OwnerControls.HasTransferHook {
-		baseProb += 0.04
-	}
-
-	// Volume bonus (optional — new tokens won't have this yet)
-	if offchain.Volume24hDEX >= s.config.MinVolumeDEX {
-		baseProb += 0.08
-	}
-
-	// Social bonus (optional)
-	totalMentions := 0
-	for _, count := range offchain.SocialMentions {
-		totalMentions += count
-	}
-	if totalMentions > 50 {
-		baseProb += 0.06
-	}
-
+    if !safety.CanBuy || !safety.CanSell {
+        return 0.0
+    }
+    
+    // Start lower - new tokens are inherently risky
+    baseProb := 0.45
+    
+    // Dev check results (you need to add this to your SafetyReport or pass separately)
+    // For now, use token.Priority as proxy
+    if token.Priority == "high" {
+        baseProb += 0.10  // Dev holds reasonable amount (2-5%)
+    } else if token.Priority == "low" {
+        baseProb -= 0.15  // Dev sold or holds too much
+    }
+    
+    // Safety bonuses (these actually matter)
+    if safety.HoneypotScore < 0.05 {
+        baseProb += 0.15
+    } else if safety.HoneypotScore > 0.15 {
+        baseProb -= 0.20
+    }
+    
+    if safety.LiquidityLocked {
+        baseProb += 0.10
+    }
+    
+    if safety.OwnerControls.Renounced {
+        baseProb += 0.08
+    }
+    
+    if !safety.OwnerControls.HasBlacklist && !safety.OwnerControls.HasTransferHook {
+        baseProb += 0.05
+    }
+    
+    // Volume - only relevant if token has traded
+    if offchain.Volume24hDEX > 50000 {
+        baseProb += 0.08
+    } else if offchain.Volume24hDEX > 10000 {
+        baseProb += 0.04
+    }
+    
+    // Social signals (low threshold for new tokens)
+    totalMentions := 0
+    for _, count := range offchain.SocialMentions {
+        totalMentions += count
+    }
+    if totalMentions > 10 {
+        baseProb += 0.06
+    }
+    
+    // PumpFun source bonus
+    if token.Token.Metadata["source"] == "pumpfun" {
+        baseProb += 0.05
+    }
+    
+    // Cap at realistic levels
+    if baseProb > 0.82 {
+        baseProb = 0.82
+    }
+    if baseProb < 0.0 {
+        baseProb = 0.0
+    }
+    
+    return baseProb
+}
 	// Velocity
 	switch offchain.Velocity {
 	case "rising":
