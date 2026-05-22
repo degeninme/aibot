@@ -14,7 +14,7 @@ RUN go mod download
 COPY . .
 
 # Build binary
-RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o trading ./cmd/trading
+RUN CGO_ENABLED=0 GOOS=linux go build -installsuffix cgo -o trading ./cmd/trading
 
 # Final stage
 FROM alpine:latest
